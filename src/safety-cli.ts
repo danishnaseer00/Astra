@@ -4,7 +4,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { launchChrome, waitForPort, CDP, killChrome } from './browser.ts'
-import { gate, inScope, cleanUrl, AuditLog, denyAll, allowAll, sanitizeArgs } from './safety.ts'
+import { gate, inScope, cleanUrl, decodeRedirect, AuditLog, denyAll, allowAll, sanitizeArgs } from './safety.ts'
 import type { GateVerdict } from './safety.ts'
 
 let pass = 0
@@ -18,7 +18,10 @@ const check = (name: string, ok: boolean, detail = '') => {
 const fake = {} as CDP
 const nav = (url: string, domains: string[] = []): Promise<GateVerdict> => gate(fake, 'navigate', { url }, domains, denyAll)
 
-check('cleanUrl strips trailing junk', cleanUrl('https://x.com/a) ') === 'https://x.com/a')
+check('cleanUrl strips whitespace + unbalanced trailing paren', cleanUrl('https://x.com/a) ') === 'https://x.com/a')
+  check('cleanUrl keeps balanced parens (Wikipedia URLs)', cleanUrl('https://en.wikipedia.org/wiki/Foo_(bar)') === 'https://en.wikipedia.org/wiki/Foo_(bar)')
+check('decodeRedirect resolves DDG redirect', decodeRedirect('https://duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FWeb_browser') === 'https://en.wikipedia.org/wiki/Web_browser')
+check('decodeRedirect passes through plain URLs', decodeRedirect('https://books.toscrape.com/') === 'https://books.toscrape.com/')
 check('inScope exact host', inScope('https://books.toscrape.com/', ['books.toscrape.com']))
 check('inScope subdomain', inScope('https://sub.books.toscrape.com/', ['books.toscrape.com']))
 check('inScope rejects other hosts', !inScope('https://en.wikipedia.org/', ['books.toscrape.com']))
@@ -39,9 +42,15 @@ v = await nav('https://example.com/profile')
 check('navigate benign not gated', !v.gated)
 v = await nav('https://example.com/order-history')
 check('navigate order-history gated (pay)', v.gated && v.why.includes('pay'), v.reason)
+v = await nav('https://httpbingo.org/forms/post')
+check('navigate to form page not gated (send is action-only)', !v.gated)
+v = await nav('file:///C:/Users/me/secret.txt')
+check('navigate to file:// gated (non-web scheme)', v.gated && v.why.includes('non-web scheme'), v.reason)
+v = await nav('javascript:alert(1)')
+check('navigate to javascript: gated (non-web scheme)', v.gated && v.why.includes('non-web scheme'), v.reason)
 
 // --- Rail 1: DOM-dependent gates (click/type — real Chrome, offline about:blank) ---
-const { proc, port } = launchChrome({})
+const { proc, port } = await launchChrome({})
 try {
   await waitForPort(port)
   const cdp = await CDP.connect(port)
@@ -51,7 +60,9 @@ try {
       '<input data-agent-i="1" type="password" name="login">' +
       '<button data-agent-i="2">Login</button>' +
       '<a data-agent-i="3" href="https://books.toscrape.com/">Books</a>' +
-      '<button data-agent-i="4">Add to cart</button>'`
+      '<button data-agent-i="4">Add to cart</button>' +
+      '<textarea data-agent-i="5">Comment</textarea>' +
+      '<button data-agent-i="6">Post comment</button>'`
   )
 
   v = await gate(cdp, 'click', { index: 0 }, [], denyAll)
@@ -68,11 +79,20 @@ try {
   v = await gate(cdp, 'click', { index: 3 }, [], denyAll)
   check('click benign link not gated', !v.gated)
 
+  v = await gate(cdp, 'click', { index: 3 }, ['wikipedia.org'], denyAll)
+  check('click link out of scoped domains gated', v.gated && v.why.includes('outside scoped domains'), v.reason)
+
   v = await gate(cdp, 'click', { index: 4 }, [], denyAll)
   check('click add-to-cart gated (pay)', v.gated && v.why.includes('pay'), v.reason)
 
   v = await gate(cdp, 'click', { index: 4 }, [], allowAll)
   check('allowAll policy approves', v.gated && v.allowed)
+
+  v = await gate(cdp, 'type', { index: 5, text: 'hello' }, [], denyAll)
+  check('type into comment field not gated (typing is local)', !v.gated, v.reason)
+
+  v = await gate(cdp, 'click', { index: 6 }, [], denyAll)
+  check('click Post-comment button gated (send)', v.gated && v.why.includes('send'), v.reason)
 
   v = await gate(cdp, 'extract', { question: 'x' }, [], denyAll)
   check('read-only tools never gated', !v.gated)

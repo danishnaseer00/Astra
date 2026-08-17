@@ -4,8 +4,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const CHROME_PATH = process.env.CHROME_PATH ?? 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe'
-// In the ESM CLI runs this is the project root; the CJS Electron bundle has no
-// import.meta.url (esbuild leaves it empty), so fall back to the working dir.
+
 let APP_ROOT: string
 try {
   APP_ROOT = fileURLToPath(new URL('..', import.meta.url))
@@ -20,9 +19,28 @@ export interface LaunchedChrome {
   profileDir: string
 }
 
-export function launchChrome(opts: { port?: number; profile?: string } = {}): LaunchedChrome {
-  const port = opts.port ?? 9222
-  const profileDir = join(PROFILES_DIR, opts.profile ?? 'default')
+// A crashed previous run can leave a stale Chrome holding the port (and the
+// profile lock). Probe for a free port so we never attach to a zombie instance
+// or fight over a locked profile.
+async function portInUse(port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(500) })
+    return res.ok
+  } catch {
+    return false // nothing answering = free
+  }
+}
+
+export async function launchChrome(opts: { port?: number; profile?: string } = {}): Promise<LaunchedChrome> {
+  const requested = opts.port ?? 9222
+  let port = requested
+  while (port < requested + 10 && (await portInUse(port))) {
+    console.log(`  (port ${port} already in use — trying ${port + 1})`)
+    port++
+  }
+  // Use a distinct profile when the port was bumped: the stale Chrome on the
+  // original port still holds the lock on its profile directory.
+  const profileDir = join(PROFILES_DIR, port === requested ? (opts.profile ?? 'default') : `${opts.profile ?? 'default'}-${port}`)
   mkdirSync(profileDir, { recursive: true })
 
   const proc = spawn(
@@ -32,9 +50,6 @@ export function launchChrome(opts: { port?: number; profile?: string } = {}): La
       `--user-data-dir=${profileDir}`,
       '--no-first-run',
       '--no-default-browser-check',
-      // Keep the window on-screen and interactive: when our own window fully
-      // covers Chrome, occlusion throttling stalls CDP input events (clicks
-      // silently vanish). These flags disable background/occlusion throttling.
       '--window-position=0,0',
       '--disable-backgrounding-occluded-windows',
       '--disable-renderer-backgrounding',
@@ -43,24 +58,27 @@ export function launchChrome(opts: { port?: number; profile?: string } = {}): La
     ],
     { stdio: 'ignore' }
   )
+  // A missing binary / permission failure surfaces here as an async 'error'
+  // event — log it instead of crashing the process with an unhandled error.
+  proc.on('error', (err) => console.error(`[chrome:spawn] ${err.message}`))
   return { proc, port, profileDir }
 }
 
-// Fresh profiles do first-run setup and can be slow; poll until the port answers.
+
 export async function waitForPort(port: number, tries = 40): Promise<void> {
   for (let i = 0; i < tries; i++) {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/json/version`)
       if (res.ok) return
     } catch {
-      // not up yet
+      // port not up yet — keep polling
     }
     await new Promise((r) => setTimeout(r, 500))
   }
   throw new Error(`Chrome never opened port ${port} (waited ${tries * 0.5}s)`)
 }
 
-// taskkill /T kills the whole tree (renderers, GPU process, ...)
+
 export function killChrome(proc: ChildProcess): void {
   if (!proc.pid || proc.killed) return
   spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { stdio: 'ignore' })
@@ -77,21 +95,18 @@ export async function listTargets(port: number): Promise<TargetInfo[]> {
   return (await res.json()) as TargetInfo[]
 }
 
-export type CdpMessage = { id?: number; result?: any; error?: { message: string } }
+export type CdpMessage = { id?: number; result?: Record<string, unknown>; error?: { message: string } }
 
-// One CDP door: commands in, {result|error} out. The WebSocket transport talks
-// to a real Chrome over a port (lesson 4); the Electron shell supplies a
-// transport over webContents.debugger (lesson 6) — same wire, two doors.
 export interface CdpCommand {
   send(method: string, params: Record<string, unknown>): Promise<CdpMessage>
   close(): void
 }
 
-// The lesson-4 door: JSON-RPC over WebSocket, responses matched by id.
 class WebSocketCommand implements CdpCommand {
   private nextId = 0
   private pending = new Map<number, (msg: CdpMessage) => void>()
   private ws: WebSocket
+  private closed = false
 
   constructor(ws: WebSocket) {
     this.ws = ws
@@ -102,9 +117,21 @@ class WebSocketCommand implements CdpCommand {
         this.pending.delete(msg.id)
       }
     }
+    // A dead transport must fail in-flight commands LOUDLY, never hang them:
+    // if Chrome dies or the socket drops mid-run, every pending command is
+    // rejected instead of resolving never (which would freeze the agent loop).
+    ws.onclose = () => this.failAll(new Error('CDP connection closed'))
+    ws.onerror = () => this.failAll(new Error('CDP connection error'))
+  }
+
+  private failAll(err: Error): void {
+    this.closed = true
+    for (const resolve of this.pending.values()) resolve({ error: { message: err.message } })
+    this.pending.clear()
   }
 
   send(method: string, params: Record<string, unknown> = {}): Promise<CdpMessage> {
+    if (this.closed) return Promise.resolve({ error: { message: 'CDP connection closed' } })
     return new Promise((resolve) => {
       const id = ++this.nextId
       this.pending.set(id, resolve)
@@ -113,11 +140,12 @@ class WebSocketCommand implements CdpCommand {
   }
 
   close(): void {
+    this.closed = true
     this.ws.close()
   }
 }
 
-// The whole control plane from lesson 4, as a class.
+
 export class CDP {
   private cmd: CdpCommand
 
@@ -125,7 +153,7 @@ export class CDP {
     this.cmd = cmd
   }
 
-  // Discover a page target over HTTP, then open the WebSocket door.
+ 
   static async connect(port: number, targetType = 'page'): Promise<CDP> {
     const targets = await listTargets(port)
     const target = targets.find((t) => t.type === targetType && !t.url.startsWith('chrome://'))
@@ -159,17 +187,21 @@ export class CDP {
   // awaitPromise: expressions may return promises (e.g. fonts.ready, rAF waits).
   async evaluate(expression: string): Promise<unknown> {
     const msg = await this.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true })
-    if (msg.result?.exceptionDetails) {
-      throw new Error(`evaluate failed: ${msg.result.exceptionDetails.text}`)
+    const detail = msg.result?.exceptionDetails as { text?: string; exception?: { description?: string } } | undefined
+    if (detail) {
+      const what = detail.exception?.description?.split('\n')[0] || detail.text || 'unknown'
+      throw new Error(`evaluate failed: ${what}`)
     }
-    return msg.result?.result?.value
+    return (msg.result?.result as { value?: unknown } | undefined)?.value
   }
 
   // A picture of the page — the seed of vision-based perception.
   async screenshot(outPath: string): Promise<void> {
     await this.send('Page.enable')
     const msg = await this.send('Page.captureScreenshot', { format: 'png' })
-    writeFileSync(outPath, Buffer.from(msg.result.data, 'base64'))
+    const data = msg.result?.data as string | undefined
+    if (!data) throw new Error('captureScreenshot returned no data')
+    writeFileSync(outPath, Buffer.from(data, 'base64'))
   }
 
   // === Phase 1: the actor — real, trusted input events ===
@@ -235,7 +267,15 @@ export class CDP {
     const isNavAnchor = target.isNavAnchor
 
     const beforeUrl = await this.evaluate('location.href').catch(() => null)
-    await this.evaluate(`(() => { window.__agent_mousedown = 0; document.addEventListener('mousedown', () => { window.__agent_mousedown++ }, true) })()`)
+    // One named listener per document, removed before re-adding: a fresh
+    // anonymous listener per click would stack forever (leak + inflated
+    // count that defeats the fired-detection below).
+    await this.evaluate(`(() => {
+      window.__agent_mousedown = 0
+      if (window.__agent_mousedown_handler) document.removeEventListener('mousedown', window.__agent_mousedown_handler, true)
+      window.__agent_mousedown_handler = () => { window.__agent_mousedown++ }
+      document.addEventListener('mousedown', window.__agent_mousedown_handler, true)
+    })()`)
 
     const dispatch = () =>
       this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }).then(() =>
@@ -314,12 +354,6 @@ export class CDP {
     if (!focused) return false
     await this.send('Input.insertText', { text })
     return true
-  }
-
-  // Press a key (Enter to submit, Tab, ...).
-  async pressKey(key: string): Promise<void> {
-    await this.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code: key })
-    await this.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code: key })
   }
 
   // Scroll the page (negative deltaY scrolls up).

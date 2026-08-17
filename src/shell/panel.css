@@ -281,8 +281,7 @@ button { font-family: inherit; }
 .dot { width: 6px; height: 6px; border-radius: 50%; flex: 0 0 auto; }
 .dot.idle { background: var(--text3); }
 .dot.running { background: var(--amber); }
-.dot.working { background: var(--green); }
-.dot.done { background: var(--green); }
+.dot.working, .dot.done { background: var(--green); }
 .dot.gate { background: var(--amber); animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.3; } }
 

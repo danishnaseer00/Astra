@@ -41,6 +41,10 @@ export function scrubPii(text: string): string {
 export async function buildSnapshot(cdp: CDP): Promise<Snapshot> {
   const raw = (await cdp.evaluate(
     `(() => {
+      // Stale index attributes from a previous snapshot must not survive:
+      // querySelector finds the FIRST match in document order, so an old
+      // attribute on a now-hidden element could hijack a click/gate lookup.
+      document.querySelectorAll('[data-agent-i]').forEach((el) => el.removeAttribute('data-agent-i'))
       const tags = 'a,button,input,textarea,select,[role="button"],[contenteditable],summary'
       const els = [...document.querySelectorAll(tags)].filter((el) => {
         const r = el.getBoundingClientRect()
@@ -73,16 +77,24 @@ export async function buildSnapshot(cdp: CDP): Promise<Snapshot> {
   )) as { url: string; title: string; bodyText: string; challengeRect: { x: number; y: number } | null; elements: SnapshotElement[] }
 
   const elements = raw.elements.map((el) => ({ ...el, text: scrubPii(el.text), href: scrubPii(el.href) }))
-  const challenge = detectChallenge(raw.title, scrubPii(raw.bodyText))
+  // URL and title can carry PII (emails, tokens, query strings) — scrub them
+  // before the render ever reaches the model.
+  const url = scrubPii(raw.url)
+  const title = scrubPii(raw.title)
+  const challenge = detectChallenge(title, scrubPii(raw.bodyText))
   const warning = challenge
     ? '\n⚠ CHALLENGE PAGE (bot check in an iframe — the agent will try to tick the checkbox; if the challenge persists, do NOT waste more steps. Use the search tool or navigate to another source.)\n'
     : ''
   // A page with almost no interactive elements is usually a JS app that never
   // hydrated for us or a bot wall — NOT an empty page to keep retrying.
-  const blind = elements.length < 5 && !challenge
+  // The nav-chrome threshold alone is useless on real sites (a pricing page
+  // has dozens of nav links), so also treat a page whose readable text is
+  // tiny as blind: real content is at least a paragraph of prose.
+  const contentless = raw.bodyText.trim().length < 120
+  const blind = (elements.length < 5 || contentless) && !challenge
     ? '\n⚠ This page exposes almost no content (JS-rendered shell or bot protection). Do NOT keep navigating to it. Use the search tool or answer from facts already gathered.\n'
     : ''
-  return { ...raw, elements, challengeRect: raw.challengeRect, render: renderSnapshot(raw.url, raw.title, elements) + warning + blind }
+  return { ...raw, url, title, elements, render: renderSnapshot(url, title, elements) + warning + blind }
 }
 
 // Cloudflare/Turnstile-style "are you a human" challenges run inside a
@@ -96,15 +108,14 @@ export function detectChallenge(title: string, text: string): boolean {
 }
 
 // The exact text the LLM reads — indexed so the agent can point at things.
-// Lossy by design (lesson 3): the model sees a capped number of elements.
-export function renderSnapshot(url: string, title: string, elements: SnapshotElement[], cap = 100): string {
-  const shown = elements.slice(0, cap)
-  const lines = shown.map((el) => {
+// Lossy by design (lesson 3): the model sees a capped number of elements
+// (buildSnapshot already slices to 120, so no second cap is needed here).
+export function renderSnapshot(url: string, title: string, elements: SnapshotElement[]): string {
+  const lines = elements.map((el) => {
     const kind = el.type ? `${el.tag}[${el.type}]` : el.tag
     const where = el.href ? ` -> ${el.href}` : ''
     const label = el.text ? ` "${el.text}"` : ''
     return `[${el.i}] <${kind}>${label}${where}`
   })
-  const more = elements.length > cap ? `... (+${elements.length - cap} more elements not shown)\n` : ''
-  return `URL: ${url}\nTITLE: ${title}\n${lines.join('\n')}\n${more}`
+  return `URL: ${url}\nTITLE: ${title}\n${lines.join('\n')}\n`
 }

@@ -26,10 +26,11 @@ const goal =
 
 const allowedDomains = values.domains ? String(values.domains).split(',').map((s) => s.trim()).filter(Boolean) : []
 const policy = values.allow ? allowAll : values.ask ? promptPolicy() : denyAll
-const timeBudgetMs = values['max-ms'] ? Number(values['max-ms']) : 5 * 60_000
+const budget = Number(values['max-ms'])
+const timeBudgetMs = values['max-ms'] && Number.isFinite(budget) && budget > 0 ? budget : 5 * 60_000
 const audit = new AuditLog(join(process.cwd(), 'logs', 'audit.jsonl'))
 
-const { proc, port } = launchChrome({})
+const { proc, port } = await launchChrome({})
 try {
   await waitForPort(port)
   const cdp = await CDP.connect(port)

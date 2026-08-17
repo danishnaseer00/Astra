@@ -1,21 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
-
-export interface RunConfig {
-  goal: string
-  mode: 'ask' | 'allow' | 'deny'
-  domains: string[]
-  maxMs: number
-  carry: boolean
-}
-
-export interface TabInfo {
-  id: number
-  label: string
-  url: string
-  favicon: string
-  active: boolean
-  closable: boolean
-}
+import type { RunConfig, TabInfo } from './ipc-types.ts'
 
 contextBridge.exposeInMainWorld('shell', {
   startRun: (cfg: RunConfig) => ipcRenderer.invoke('run:start', cfg),

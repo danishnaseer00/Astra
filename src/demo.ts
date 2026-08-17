@@ -1,6 +1,6 @@
 import { launchChrome, waitForPort, CDP, killChrome } from './browser.ts'
 
-const { proc, port } = launchChrome({})
+const { proc, port } = await launchChrome({})
 try {
   await waitForPort(port)
   const cdp = await CDP.connect(port)

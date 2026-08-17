@@ -1,5 +1,3 @@
-// llm.ts — the brain link: a minimal OpenAI-compatible client.
-// Phase 2: plain chat. Phase 3: tool calling.
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
@@ -19,15 +17,15 @@ export interface ToolSchema {
   function: { name: string; description: string; parameters: Record<string, unknown> }
 }
 
-export interface ChatOptions {
-  temperature?: number
-  maxTokens?: number
-}
-
 export interface ChatWithToolsResult {
   content: string
   toolCalls: { id: string; name: string; args: Record<string, unknown> }[]
-  finishReason: string
+}
+
+// Plain chat round (no tools) — used by the phase-2/3 lesson CLIs.
+export async function chat(messages: ChatMessage[], temperature = 0.4): Promise<string> {
+  const json = await callOpenAI({ model: MODEL, messages, temperature })
+  return json.choices?.[0]?.message?.content ?? ''
 }
 
 const BASE = process.env.LLM_BASE_URL ?? 'https://api.llm7.io/v1'
@@ -43,7 +41,14 @@ console.log(`[llm:boot] base=${BASE} model=${MODEL} key=${KEY.startsWith('sk') |
 let lastCallAt = 0
 const MIN_GAP_MS = 2200
 
-async function callOpenAI(body: Record<string, unknown>): Promise<any> {
+interface ChatCompletion {
+  choices?: {
+    message?: { content?: string | null; tool_calls?: ToolCallWire[] }
+    finish_reason?: string
+  }[]
+}
+
+async function callOpenAI(body: Record<string, unknown>): Promise<ChatCompletion> {
   const RETRIES = 8
   for (let attempt = 0; attempt <= RETRIES; attempt++) {
     // Throttle: space requests out so bursts don't trip the per-minute cap.
@@ -97,29 +102,13 @@ async function callOpenAI(body: Record<string, unknown>): Promise<any> {
   throw new Error('LLM request failed: retries exhausted')
 }
 
-export async function chat(messages: ChatMessage[], opts: ChatOptions = {}): Promise<string> {
-  const body: Record<string, unknown> = {
-    model: MODEL,
-    messages,
-    temperature: opts.temperature ?? 0.4,
-  }
-  if (opts.maxTokens) body.max_tokens = opts.maxTokens
-  const json = await callOpenAI(body)
-  return json.choices?.[0]?.message?.content ?? ''
-}
-
-// Tool-calling round: the model replies with either text or one+ tool calls.
-export async function chatWithTools(
-  messages: ChatMessage[],
-  tools: ToolSchema[],
-  opts: ChatOptions = {}
-): Promise<ChatWithToolsResult> {
+export async function chatWithTools(messages: ChatMessage[], tools: ToolSchema[]): Promise<ChatWithToolsResult> {
   const json = await callOpenAI({
     model: MODEL,
     messages,
     tools,
     tool_choice: 'auto',
-    temperature: opts.temperature ?? 0.4,
+    temperature: 0.4,
   })
   const msg = json.choices?.[0]?.message
   const toolCalls = (msg?.tool_calls ?? []).map((tc: ToolCallWire) => {
@@ -131,5 +120,5 @@ export async function chatWithTools(
     }
     return { id: tc.id, name: tc.function.name, args }
   })
-  return { content: msg?.content ?? '', toolCalls, finishReason: json.choices?.[0]?.finish_reason ?? '' }
+  return { content: msg?.content ?? '', toolCalls }
 }

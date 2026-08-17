@@ -1,22 +1,20 @@
-// agent.ts — Phase 3: the agent loop (lesson 5).
-// perceive → decide → execute → re-perceive, until done or the budget runs out.
-
 import type { CDP } from './browser.ts'
 import { sleep } from './browser.ts'
 import { buildSnapshot, type Snapshot } from './perceive.ts'
 import { scrubPii } from './perceive.ts'
 import { chatWithTools, type ChatMessage, type ChatWithToolsResult, type ToolSchema } from './llm.ts'
-import { gate, cleanUrl, denyAll, sanitizeArgs, type AuditLog, type Policy } from './safety.ts'
+import { gate, cleanUrl, denyAll, sanitizeArgs, MUTATING, type AuditLog, type Policy } from './safety.ts'
 
-export const BUDGET = 24
+const BUDGET = 24
 
 // The six-tool vocabulary from lesson 5. Few and stable.
-export const TOOLS: ToolSchema[] = [
+const TOOLS: ToolSchema[] = [
   {
     type: 'function',
     function: {
       name: 'navigate',
-      description: 'Go to a URL. Use when the goal needs a different page. Check the URL after navigating.',
+      description:
+        'Go to a URL. If the goal names a URL, navigate to it directly — do NOT search for it. Check the URL after navigating.',
       parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
     },
   },
@@ -56,7 +54,8 @@ export const TOOLS: ToolSchema[] = [
     type: 'function',
     function: {
       name: 'extract',
-      description: 'Read the full text of the current page. Use to answer questions about page content (prices, titles, details).',
+      description:
+        'Read the current page (structured prices if present, then main text). Use to answer questions about page content (prices, titles, details).',
       parameters: { type: 'object', properties: { question: { type: 'string' } }, required: ['question'] },
     },
   },
@@ -80,7 +79,7 @@ export const TOOLS: ToolSchema[] = [
 ]
 
 // The agent's constitution (lesson 5 §3).
-export const SYSTEM =
+const SYSTEM =
   'You are a web agent. The user gives you a goal; the live page is your only source of truth. ' +
   'Each element in a snapshot has an index — refer to elements by index only, never invent selectors. ' +
   'Prefer clicking elements over constructing URLs by hand; if you must navigate, copy the href from the snapshot exactly. ' +
@@ -94,7 +93,12 @@ export const SYSTEM =
   'Tool calls are plain JSON function calls — never XML, markup, or code blocks. Only a real tool call (or done with an answer) is accepted. ' +
   'If an action comes back DENIED by the safety policy, respect it: do not retry the same action; adjust the plan, find another path, or call done. ' +
   'Use the search tool to find pages when the goal does not name a URL — never invent URLs from memory; open the most promising search result. ' +
-  'You may emit MULTIPLE tool calls in one reply ONLY when they are read-only and independent (search, extract, scroll). navigate, click, and type change the page: at most ONE of those per reply — afterwards wait for the refreshed snapshot before acting again.'
+  'If the goal names a URL, navigate to it directly — never search for a URL you already have. ' +
+  'Only report what you actually observed: never claim a failed navigation, a recovery, or a page visit you did not perform. ' +
+  'You may emit MULTIPLE tool calls in one reply ONLY when they are read-only and independent (search, extract, scroll). ' +
+  'navigate, click, and type change the page: at most ONE of those per reply — afterwards wait for the refreshed snapshot before acting again. ' +
+  'Scroll changes the layout but not the page: after a scroll in the same reply, snapshot indexes are stale — never click or type after scrolling; wait for the next snapshot. ' +
+  'If you are warned that you are looping, stop repeating the same navigation/search/extract and answer from the facts you already have.'
 
 const selFor = (i: unknown) => `[data-agent-i="${String(i)}"]`
 
@@ -124,22 +128,46 @@ async function execute(cdp: CDP, name: string, args: Record<string, unknown>, op
       return 'Scrolled.'
     }
     case 'extract': {
+      // SPA hydration settle: readyState "complete" + fonts can be true while
+      // React/Vue content is still mounting. One short beat makes the read
+      // land on rendered content, not an empty shell (prices on claude.com,
+      // chatgpt.com, etc.).
+      await sleep(600)
       // Structured facts first (pair prices with their product titles), then raw text.
+      // The facts pass is for catalog pages only: require 2+ distinct priced rows,
+      // or a stray "$5" in some unrelated element becomes a fake "PRICES" section.
       const facts = (await cdp.evaluate(
         `(() => {
-          const rows = [...document.querySelectorAll('article, li, .product, [class*="product"], .card, tr')]
+          const rows = [...document.querySelectorAll('article, .product, [class*="product"], .card')]
             .filter((el) => /[£$€]\\s?\\d/.test(el.innerText || ''))
             .map((el) => {
               const price = (el.innerText.match(/[£$€]\\s?\\d+\\.?\\d*/) || [''])[0].trim()
               const title = (el.querySelector('h1, h2, h3, h4, a[title], .title, td')?.innerText || el.innerText.split('\\n').find((l) => l.trim()) || '').trim().slice(0, 80)
-              return price && title !== price ? price + ' — ' + title : null
+              // Ratings are CSS classes (books.toscrape: p.star-rating.Three),
+              // invisible to innerText — surface them so the model can actually
+              // judge quality instead of guessing (task.md T8/T14 failed on this).
+              const stars = (el.querySelector('[class*="star-rating"]')?.className.match(/star-rating\\s+(\\w+)/) || [])[1]
+              return price && title !== price ? price + ' — ' + title + (stars ? ' | rating: ' + stars : '') : null
             })
             .filter(Boolean)
           return [...new Set(rows)].slice(0, 40)
         })()`
       )) as string[]
-      const text = scrubPii((await cdp.evaluate('document.body.innerText')) as string)
-      const priced = facts.length ? 'PRICES ON THIS PAGE:\n' + facts.join('\n') + '\n\n' : ''
+      // Nav bars and hero sections sit at the TOP of body.innerText — on long
+      // pages a top-only slice reads as "header junk" and the model re-extracts
+      // forever. Prefer <main> (the content region) and, when the page is long,
+      // keep the head AND the tail so mid/lower-page content (prices, plans)
+      // actually reaches the model.
+      const text = scrubPii((await cdp.evaluate(
+        `(() => {
+          const main = document.querySelector('main')
+          const t = (main && main.innerText) || document.body.innerText || ''
+          const cap = 7600
+          if (t.length <= cap) return t
+          return t.slice(0, 3000) + '\\n...[middle ' + (t.length - cap) + ' chars omitted]...\\n' + t.slice(-(cap - 3000))
+        })()`
+      )) as string)
+      const priced = facts.length >= 2 ? 'PRICES ON THIS PAGE:\n' + facts.join('\n') + '\n\n' : ''
       return (priced + 'PAGE TEXT:\n' + text).slice(0, 8000)
     }
     case 'search': {
@@ -160,6 +188,10 @@ async function execute(cdp: CDP, name: string, args: Record<string, unknown>, op
                   const d = atob(b64.startsWith('a1') ? b64.slice(2) : b64)
                   if (d.startsWith('http')) return d
                 }
+                if (u.hostname === 'duckduckgo.com' && u.pathname === '/l/') {
+                  const d = u.searchParams.get('uddg')
+                  if (d) return d
+                }
               } catch {}
               return h
             }
@@ -172,7 +204,7 @@ async function execute(cdp: CDP, name: string, args: Record<string, unknown>, op
             for (const r of document.querySelectorAll('.result')) {
               const a = r.querySelector('.result__a')
               const sn = r.querySelector('.result__snippet')
-              if (a) out.push((a.innerText || '').trim() + ' \u2014 ' + (a.href || '') + (sn && sn.innerText ? ' | ' + sn.innerText.trim().slice(0, 180) : ''))
+              if (a) out.push((a.innerText || '').trim() + ' \u2014 ' + real(a.href || '') + (sn && sn.innerText ? ' | ' + sn.innerText.trim().slice(0, 180) : ''))
             }
             return out.slice(0, 8)
           })()`
@@ -244,7 +276,6 @@ export interface AgentOptions {
 // gets exactly what it needs to act now, not an accumulating transcript.
 const TOOL_RESULT_CAP = 2000
 const HISTORY_CAP = 20
-const MUTATING = new Set(['navigate', 'click', 'type'])
 const estimateTokens = (s: string) => Math.round(s.length / 4)
 
 export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}): Promise<AgentRun> {
@@ -260,38 +291,60 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
 
   const push = (msg: ChatMessage) => {
     history.push(msg)
-    if (history.length > HISTORY_CAP) history.splice(0, history.length - HISTORY_CAP)
-  }
-
-  // Loop detection: navigation targets the agent keeps revisiting without
-  // progress burn steps and the budget. Track visit counts; once a URL is
-  // visited 3+ times, nudge the model ONCE to stop and use what it has.
-  // The nudge rides inside the snapshot system message — a user message would
-  // sit directly after a tool result, which Mistral's API rejects (400).
-  const navVisits = new Map<string, number>()
-  const navNudged = new Set<string>()
-  let pendingNudge = ''
-  const nudgeIfLooping = () => {
-    for (const [url, n] of navVisits) {
-      if (n >= 3 && !navNudged.has(url)) {
-        navNudged.add(url)
-        pendingNudge = `\nNOTE: You are looping — you have navigated to ${url} ${n} times and it is not yielding usable content. STOP re-visiting it. Answer from facts you already have (search results, earlier extracts) with done(answer), or use search to find a completely different source.\n`
-        console.log(`  !! loop nudge: ${url} visited ${n} times`)
-      }
+    if (history.length > HISTORY_CAP) {
+      // Trimming runs on EVERY push — mid-batch, an assistant's tool results
+      // are still being appended. Never split a tool_calls message from its
+      // results, and never leave a tool message at the head: Mistral rejects a
+      // 'tool' message that follows 'user' (400 invalid_request_message_order).
+      let drop = history.length - HISTORY_CAP
+      while (drop < history.length && history[drop].role === 'tool') drop++
+      history.splice(0, drop)
     }
   }
 
+  // Loop detection: repeated identical actions burn steps and budget — the
+  // same navigation, the same search query, or extract on the same page.
+  // Count each action; once one hits 3+, nudge the model ONCE to stop and use
+  // what it has. The nudge rides inside the snapshot system message — a user
+  // message would sit directly after a tool result, which Mistral's API
+  // rejects (400).
+  const actionCounts = new Map<string, number>()
+  const actionNudged = new Set<string>()
+  let pendingNudge = ''
+  const bumpAction = (kind: 'nav' | 'search' | 'extract', key: string): void => {
+    const k = `${kind}:${key}`
+    actionCounts.set(k, (actionCounts.get(k) ?? 0) + 1)
+    const n = actionCounts.get(k)!
+    if (n >= 3 && !actionNudged.has(k)) {
+      actionNudged.add(k)
+      const what = kind === 'nav' ? `navigated to ${key}` : kind === 'search' ? `run the same search "${key}"` : `extracted the page ${key}`
+      pendingNudge = `\nNOTE: You are looping — you have ${what} ${n} times and it is not yielding usable content. STOP repeating it. Answer from facts you already have (search results, earlier extracts) with done(answer), or use search to find a completely different source.\n`
+      console.log(`  !! loop nudge: ${what} (${n} times)`)
+    }
+  }
+
+  // Facts gathered during the run survive the budget: if the loop ends
+  // exhausted, the answer still reports what was learned.
+  const gathered: string[] = []
+  const remember = (block: string): void => {
+    const slim = block.replace(/\s+/g, ' ').trim().slice(0, 300)
+    if (slim && !gathered.includes(slim)) gathered.push(slim)
+    if (gathered.length > 12) gathered.shift()
+  }
+  const gatheredTail = (): string =>
+    gathered.length ? '\n\nFACTS GATHERED SO FAR:\n- ' + gathered.join('\n- ') : ''
+
   for (let step = 1; step <= BUDGET; step++) {
-    if (isCancelled?.()) return { answer: '[cancelled] task stopped by the user', steps: step, totalTokens, gated, denied }
+    if (isCancelled?.()) return { answer: '[cancelled] task stopped by the user' + gatheredTail(), steps: step, totalTokens, gated, denied }
     if (Date.now() - startedAt > timeBudgetMs) {
-      return { answer: '[time budget exhausted] task incomplete', steps: step, totalTokens, gated, denied }
+      return { answer: '[time budget exhausted] task incomplete' + gatheredTail(), steps: step, totalTokens, gated, denied }
     }
     let snapshot: Snapshot
     try {
       snapshot = await buildSnapshot(cdp)
     } catch (err) {
       const why = err instanceof Error ? err.message : String(err)
-      return { answer: `[agent stuck: could not perceive the page — ${why}]`, steps: step, totalTokens, gated, denied }
+      return { answer: `[agent stuck: could not perceive the page — ${why}]` + gatheredTail(), steps: step, totalTokens, gated, denied }
     }
     // Bounded challenge auto-click: tick the Turnstile checkbox by dispatching
     // a TRUSTED click at the iframe's center (cross-origin blocks JS, not
@@ -306,24 +359,31 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
       await sleep(2500)
       continue
     }
-    // Loop detection runs BEFORE the context is built, so the nudge reaches
-    // the model this very step instead of one step later.
-    nudgeIfLooping()
-    const buildContext = (): ChatMessage[] => [
+    // The snapshot system message carries any pending loop nudge. buildContext
+    // is PURE (takes the nudge as an argument) because it is called for token
+    // estimation AND for the real model call — a side effect here would let
+    // the estimate consume the nudge and the model would never see it.
+    const buildContext = (nudge: string): ChatMessage[] => [
       { role: 'system', content: SYSTEM },
       {
         role: 'user',
         content: `GOAL: ${goal}${context ? `\n\nCONTEXT FROM PREVIOUS TURNS:\n${context}` : ''}`,
       },
       ...history,
-      { role: 'system', content: `CURRENT SNAPSHOT (fresh):\n${snapshot.render}${pendingNudge}` },
+      { role: 'system', content: `CURRENT SNAPSHOT (fresh):\n${snapshot.render}${nudge}` },
     ]
 
-    const stepTokens = estimateTokens(JSON.stringify(buildContext()))
+    const stepTokens = estimateTokens(JSON.stringify(buildContext('')))
     totalTokens += stepTokens
     console.log(`\n--- step ${step} (${snapshot.elements.length} elements, ~${stepTokens.toLocaleString()} tokens) ---`)
 
-    const decide = async () => chatWithTools(buildContext(), TOOLS)
+    // The nudge is captured and cleared exactly once, on the FIRST real model
+    // call of the step — later retries in this step see no nudge.
+    const decide = async () => {
+      const nudge = pendingNudge
+      pendingNudge = ''
+      return chatWithTools(buildContext(nudge), TOOLS)
+    }
     // The free-tier gateway can fail mid-run (429 concurrency, timeouts). The
     // loop must degrade to a truthful failure message, never crash.
     let decision: ChatWithToolsResult
@@ -375,14 +435,14 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     } catch (err) {
       const why = err instanceof Error ? err.message : String(err)
       console.log(`  !! LLM API failed — ${why}`)
-      return { answer: `[agent stuck: the model API failed (${why}). Wait a moment, then run again.]`, steps: step, totalTokens, gated, denied }
+      return { answer: `[agent stuck: the model API failed (${why}). Wait a moment, then run again.]` + gatheredTail(), steps: step, totalTokens, gated, denied }
     }
     if (decision.toolCalls.length === 0) {
       const raw = decision.content.trim()
       // Real answers are short. Empty, markup, a page dump, or a bare tool-call
       // echo = glitch, not an answer.
       const junk = !raw || raw.includes('</') || raw.includes('```') || /^\s*\{?\s*"name"\s*:\s*"/.test(raw) || raw.length > 500
-      const answer = junk ? '[agent stuck: the model stopped replying with tool calls]' : raw
+      const answer = junk ? '[agent stuck: the model stopped replying with tool calls]' + gatheredTail() : raw
       console.log('  (stopping on plain-text reply)')
       return { answer, steps: step, totalTokens, gated, denied }
     }
@@ -401,7 +461,10 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     // Phase 6 batching: read-only tools may share a step, but mutating tools
     // change the page — the snapshot contract (latest snapshot is truth) means
     // at most ONE of them per decision. Later ones fail loudly, in-band.
+    // Scroll does not mutate the DOM but moves it: indexes captured before a
+    // scroll are stale, so click/type after scroll are rejected the same way.
     let mutated = false
+    let scrolled = false
     for (const tc of decision.toolCalls) {
       if (tc.name === 'done') {
         const answer = String(tc.args.answer ?? '').trim()
@@ -419,6 +482,14 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
       if (MUTATING.has(tc.name) && mutated) {
         const stale = 'FAILED: the page changed earlier in this step, so this index/URL is stale. The latest snapshot is truth — act on it in the NEXT step, one change per step.'
         console.log(`  -> ${tc.name}(${JSON.stringify(tc.args).slice(0, 120)}) — FAILED (stale: page already changed this step)`)
+        push({ role: 'tool', tool_call_id: tc.id, content: stale })
+        continue
+      }
+      // A scroll shifts every element; indexes from the pre-scroll snapshot
+      // no longer point where the model thinks they do.
+      if ((tc.name === 'click' || tc.name === 'type') && scrolled) {
+        const stale = 'FAILED: the page scrolled earlier in this step, so this index is stale. The latest snapshot is truth — wait for the NEXT step to act on a fresh snapshot.'
+        console.log(`  -> ${tc.name}(${JSON.stringify(tc.args).slice(0, 120)}) — FAILED (stale: scrolled this step)`)
         push({ role: 'tool', tool_call_id: tc.id, content: stale })
         continue
       }
@@ -456,9 +527,24 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
       }
 
       const result = await execute(cdp, tc.name, tc.args, opts)
-      if (tc.name === 'navigate') {
-        const url = String(tc.args.url ?? '')
-        navVisits.set(url, (navVisits.get(url) ?? 0) + 1)
+      if (tc.name === 'navigate') bumpAction('nav', cleanUrl(String(tc.args.url ?? '')))
+      if (tc.name === 'search') bumpAction('search', String(tc.args.query ?? '').trim().toLowerCase())
+      if (tc.name === 'scroll') scrolled = true
+      // Keep the facts the model earned: search hits and priced extracts are
+      // remembered in compact form, so a budget-exhausted run still reports
+      // what it learned instead of a bare failure line.
+      if (tc.name === 'search') {
+        // The first result lines are the actionable ones (title — URL).
+        const hits = result.split('\n').filter((l) => l.includes(' — ')).slice(0, 5).join('\n')
+        if (hits) remember(hits)
+      }
+      if (tc.name === 'extract') {
+        // Loop-keyed by page, not question: re-extracting the SAME page is the
+        // waste pattern (a page that yields nothing, extracted over and over).
+        const at = ((await cdp.evaluate('location.href').catch(() => '')) as string) || '(no page)'
+        bumpAction('extract', cleanUrl(at))
+        const priced = result.match(/PRICES ON THIS PAGE:\n([\s\S]*?)(?=\nPAGE TEXT:)/)?.[1]
+        if (priced) remember(priced)
       }
       audit?.append({
         ts: new Date().toISOString(),
@@ -475,5 +561,5 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     }
   }
 
-  return { answer: '[budget exhausted] task incomplete', steps: BUDGET, totalTokens, gated, denied }
+  return { answer: '[budget exhausted] task incomplete' + gatheredTail(), steps: BUDGET, totalTokens, gated, denied }
 }

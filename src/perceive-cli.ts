@@ -1,10 +1,8 @@
-// perceive-cli.ts — Phase 2 win: show what the agent sees, then let the LLM
-// read the same snapshot. Also proves PII never reaches the model.
 import { launchChrome, waitForPort, CDP, killChrome, sleep } from './browser.ts'
 import { buildSnapshot } from './perceive.ts'
 import { chat } from './llm.ts'
 
-const { proc, port } = launchChrome({})
+const { proc, port } = await launchChrome({})
 try {
   await waitForPort(port)
   const cdp = await CDP.connect(port)
@@ -25,7 +23,7 @@ try {
   console.log('\nLLM7 says:\n' + answer)
 
   console.log('\n=== Part 2: PII never leaves the machine ===')
-  await cdp.navigate('https://httpbin.org/forms/post')
+  await cdp.navigate('https://httpbingo.org/forms/post')
   await cdp.type('input[name="custemail"]', 'alice@example.com')
   await cdp.type('input[name="custtel"]', '+1 555-123-4567')
   await sleep(300)

@@ -5,3 +5,4 @@ dist/
 .env
 logs/
 smoke-*.txt
+smoke-*.log

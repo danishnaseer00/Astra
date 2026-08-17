@@ -22,16 +22,30 @@ const BLOCKLIST: { label: string; re: RegExp }[] = [
   { label: 'delete', re: /\bdelete\b|\bremove\b|destroy|deactivate|close\s*account/ },
 ]
 
-function matchesBlocklist(text: string): string[] {
+// The send rail is ACTION-only: navigating to a form page (httpbin's demo
+// lives at /forms/post) or typing into a comment field transmits nothing —
+// only the click that submits is gated. Destinations keep the rest.
+const DESTINATION_RAILS = BLOCKLIST.filter(({ label }) => label !== 'send')
+const TYPE_RAILS = BLOCKLIST.filter(({ label }) => label !== 'send')
+
+function matchesBlocklist(text: string, rails: typeof BLOCKLIST): string[] {
   const t = text.toLowerCase()
   const hits: string[] = []
-  for (const { label, re } of BLOCKLIST) if (re.test(t)) hits.push(label)
+  for (const { label, re } of rails) if (re.test(t)) hits.push(label)
   return [...new Set(hits)]
 }
 
 // One sanitizer for URL handling: the gate and the executor must judge the
 // same URL, or the model could smuggle junk past one of them.
-export const cleanUrl = (u: string) => u.trim().replace(/[)\s]+$/, '')
+// Only trailing whitespace is always junk; a trailing ")" is stripped ONLY
+// when the URL has no matching "(" (models wrap URLs in prose parens, but
+// ")" is legal inside real URLs — Wikipedia titles, disambiguation pages).
+export const cleanUrl = (u: string): string => {
+  const t = u.trim()
+  const opens = (t.match(/\(/g) ?? []).length
+  const closes = (t.match(/\)/g) ?? []).length
+  return closes > opens ? t.replace(/[)\s]+$/, '') : t
+}
 
 // --- Rail 3: domain scoping ---------------------------------------------------
 export function inScope(url: string, allowed: string[]): boolean {
@@ -45,12 +59,47 @@ export function inScope(url: string, allowed: string[]): boolean {
   return allowed.some((d) => host === d || host.endsWith('.' + d))
 }
 
+// Rail 2 (scheme): only http(s) destinations are ever acceptable. The gate
+// must refuse file:/data:/javascript: etc. BEFORE the executor sees them —
+// the model should never be able to read local files or run script URLs.
+const WEB_SCHEME = /^https?:\/\//i
+
+export function isWebUrl(url: string): boolean {
+  return WEB_SCHEME.test(url)
+}
+
 const urlDomain = (url: string): string | undefined => {
   try {
     return new URL(url).hostname
   } catch {
     return undefined
   }
+}
+
+// Decode a search-engine redirect URL back to the real destination. The gate
+// and the executor must judge the SAME target, or the model could smuggle an
+// out-of-scope site through a redirect link (clicking a Bing/DDG result goes
+// through a /url?u=... or /l/?uddg=... hop that lands anywhere).
+export function decodeRedirect(href: string): string {
+  try {
+    const u = new URL(href)
+    if (u.hostname === 'www.bing.com') {
+      const b64 = u.searchParams.get('u')
+      if (b64) {
+        const d = atob(b64.startsWith('a1') ? b64.slice(2) : b64)
+        if (d.startsWith('http')) return d
+      }
+      const q = u.searchParams.get('q')
+      if (q && WEB_SCHEME.test(q)) return q
+    }
+    if (u.hostname === 'duckduckgo.com' && u.pathname === '/l/') {
+      const d = u.searchParams.get('uddg')
+      if (d) return d
+    }
+  } catch {
+    // not a URL — leave as-is
+  }
+  return href
 }
 
 // --- The gate ----------------------------------------------------------------
@@ -96,7 +145,12 @@ export function promptPolicy(opts: { timeoutMs?: number } = {}): Policy {
   }
 }
 
-const GATEABLE = new Set(['navigate', 'click', 'type'])
+// The page-changing tools. SINGLE source of truth: the agent loop uses it to
+// refuse batched mutating calls, and the gate gates exactly these. Keep the
+// tool list in one place so a new tool can't be forgotten in one of the two
+// copies (a real past bug: search navigates, but wasn't gated).
+export const MUTATING = new Set(['navigate', 'click', 'type'])
+const GATEABLE = MUTATING
 
 // Inspect the target element for click/type gates — code reads the DOM, the
 // LLM never writes the summary. Deny on uncertainty: if the page won't tell
@@ -140,11 +194,15 @@ export async function gate(
   if (tool === 'navigate') {
     const url = cleanUrl(String(args.url ?? ''))
     domain = urlDomain(url)
-    if (allowedDomains.length > 0 && !inScope(url, allowedDomains)) {
+    // Rail 2: refuse non-web schemes outright — deny on uncertainty.
+    if (!isWebUrl(url)) {
+      why = ['non-web scheme']
+      summary = `Navigate to ${url}\nDENIED: only http(s) destinations are allowed`
+    } else if (allowedDomains.length > 0 && !inScope(url, allowedDomains)) {
       why = ['outside scoped domains']
       summary = `Navigate to ${url}\nSCOPING: allowed domains are ${allowedDomains.join(', ')}`
     } else {
-      why = matchesBlocklist(url)
+      why = matchesBlocklist(url, DESTINATION_RAILS)
       summary = `Navigate to ${url}`
     }
   } else {
@@ -154,8 +212,21 @@ export async function gate(
       return { allowed: false, gated: true, summary: `${tool} element ${String(args.index)}`, reason: 'element unreadable — denied on uncertainty', why: ['unreadable'] }
     }
     summary = el.summary
-    why = matchesBlocklist(`${el.text} ${el.href} ${el.isPassword ? 'password' : ''}`)
+    why = matchesBlocklist(`${el.text} ${el.href} ${el.isPassword ? 'password' : ''}`, tool === 'type' ? TYPE_RAILS : BLOCKLIST)
     if (tool === 'type' && el.isPassword) why = why.length ? [...why, 'login'] : ['login']
+    // The click target's REAL destination (past any engine redirect) must
+    // respect the same rails as navigate — otherwise scope can be bypassed
+    // by clicking a search result that hops to an off-scope site. Only real
+    // links carry a destination; buttons/inputs have an empty href and are
+    // judged by their text/type above.
+    if (el.href) {
+      const dest = decodeRedirect(el.href)
+      if (!isWebUrl(dest)) {
+        why = [...why, 'non-web scheme']
+      } else if (allowedDomains.length > 0 && !inScope(dest, allowedDomains)) {
+        why = [...why, 'outside scoped domains']
+      }
+    }
   }
 
   if (why.length === 0) return { allowed: true, gated: false, summary, reason: '', why: [] }

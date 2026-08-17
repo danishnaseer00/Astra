@@ -1,5 +1,3 @@
-// actor.ts — Phase 1 win: drive a real site with trusted input events.
-// Fills httpbin.org's classic demo form and submits it.
 import { launchChrome, waitForPort, CDP, killChrome, sleep } from './browser.ts'
 
 // The executor must surface failures, never swallow them silently.
@@ -7,7 +5,7 @@ function must(ok: boolean, what: string): asserts ok {
   if (!ok) throw new Error(`action failed: ${what} (element not found or not visible)`)
 }
 
-const { proc, port } = launchChrome({})
+const { proc, port } = await launchChrome({})
 try {
   await waitForPort(port)
   const cdp = await CDP.connect(port)

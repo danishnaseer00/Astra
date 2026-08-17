@@ -6,12 +6,13 @@
 // agent pane on the right. The page views live between them: each tab is a
 // WebContentsView inset below the chrome and left of the pane.
 import { app, BrowserWindow, WebContentsView, ipcMain, session } from 'electron'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { CDP } from '../browser.ts'
 import { AuditLog, allowAll, denyAll, type Policy, type SensitiveAction } from '../safety.ts'
 import { DebuggerCommand } from './electron-transport.ts'
+import type { RunConfig, TabInfo } from './ipc-types.ts'
 
 const OMNIBOX_H = 48
 const TAB_STRIP_H = 34
@@ -26,8 +27,16 @@ function loadEnv(): void {
   const f = join(process.cwd(), '.env')
   if (!existsSync(f)) return
   for (const line of readFileSync(f, 'utf8').split('\n')) {
-    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/)
-    if (m && !(m[1] in process.env)) process.env[m[1]] = m[2]
+    const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/)
+    if (!m || m[1] in process.env) continue
+    let value = m[2].trim()
+    // Unquoted values: strip an inline comment ("KEY=value # note").
+    if (!value.startsWith('"') && !value.startsWith("'")) value = value.replace(/\s+#.*$/, '')
+    // Quoted values: drop the surrounding quotes.
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1)
+    }
+    process.env[m[1]] = value
   }
 }
 
@@ -59,7 +68,7 @@ const sendToPanel = (channel: string, payload: unknown): void => {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload)
 }
 
-const tabInfo = (t: Tab) => ({
+const tabInfo = (t: Tab): TabInfo => ({
   id: t.id,
   label: t.label,
   url: t.url,
@@ -83,6 +92,10 @@ const broadcastTab = (t: Tab): void => sendToPanel('tab:info', tabInfo(t))
 const resetView = (): void => {
   const v = agentTab?.wc.webContents
   if (v && !v.isDestroyed()) void v.loadURL('about:blank')
+  if (lastSearchTabId !== null) {
+    closeTab(lastSearchTabId)
+    lastSearchTabId = null
+  }
 }
 
 // The agent streams step lines through console.log — tee them to the panel.
@@ -127,12 +140,15 @@ const layout = (): void => {
   for (const t of tabs) t.wc.setBounds({ x: 0, y: CHROME_H, width: cw, height: ch })
 }
 
-const createTab = (url?: string, label = 'New tab', opts: { activate?: boolean; closable?: boolean } = {}): Tab => {
-  const { activate = true, closable = true } = opts
-  // Every tab shares the isolated agent profile (rail 5): its cookies live in
-  // a session partition of their own, never the browser's real profile.
+const createTab = (url?: string, label = 'New tab', opts: { activate?: boolean; closable?: boolean; agent?: boolean } = {}): Tab => {
+  const { activate = true, closable = true, agent = false } = opts
+  // Session isolation (rail 5): the agent workspace lives in its own
+  // partition, and user-opened tabs in ANOTHER — so a login the user makes
+  // in a normal tab can never be seen or acted on by the agent, and vice
+  // versa. Neither touches the browser's real profile.
+  const partition = agent ? 'persist:agent' : 'persist:user'
   const wc = new WebContentsView({
-    webPreferences: { session: session.fromPartition('persist:agent') },
+    webPreferences: { session: session.fromPartition(partition) },
   })
   const t: Tab = { id: ++tabSeq, wc, label, url: url ?? '', favicon: '', closable }
   wc.webContents.on('did-navigate', (_e, u) => {
@@ -219,68 +235,10 @@ async function createWindow(): Promise<void> {
       preload: join(__dirname, 'shell-preload.cjs'),
     },
   })
-  // TEMP DEBUG: SHELL_DEBUG_PANEL=1 wires renderer diagnostics to the console.
-  if (process.env.SHELL_DEBUG_PANEL) {
-    win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
-      console.log(`[panel:console/${level}] ${message} (${sourceId}:${line})`)
-    })
-    win.webContents.on('did-fail-load', (_e, code, desc, url) => {
-      console.log(`[panel:fail-load] ${code} ${desc} ${url}`)
-    })
-    win.webContents.on('render-process-gone', (_e, details) => {
-      console.log(`[panel:gone] ${JSON.stringify(details)}`)
-    })
-  }
   const panelPath = join(__dirname, 'panel', 'panel.html')
   console.log(`[panel:path] ${panelPath} exists=${existsSync(panelPath)}`)
   await win.loadFile(panelPath)
   console.log(`[panel:loaded] title=${win.webContents.getTitle()}`)
-  const w1 = win
-  if (process.env.SHELL_DEBUG_PANEL) {
-    w1.webContents.openDevTools({ mode: 'detach' })
-    setTimeout(async () => {
-      const probe = await w1.webContents.executeJavaScript(
-        `JSON.stringify({
-          tabs: document.querySelectorAll('.tab').length,
-          omnibox: !!document.querySelector('#omnibox-input'),
-          pane: !!document.querySelector('#pane'),
-          composer: !!document.querySelector('.composer'),
-          stylesheets: document.styleSheets.length,
-          cssApplied: getComputedStyle(document.body).backgroundColor,
-          theme: document.body.dataset.theme,
-          size: [window.innerWidth, window.innerHeight],
-        })`
-      )
-      console.log(`[panel:probe] ${probe}`)
-      // TEMP: expand Steps & Tokens with injected log lines, then measure
-      // every box — proves (in numbers) whether anything escapes the chrome.
-      await w1.webContents.executeJavaScript(
-        `(function(){ const l = document.querySelector('#log'); l.textContent = ''; for (let i = 1; i <= 60; i++) { const d = document.createElement('div'); d.textContent = '--- step ' + i + ' (fake line for layout probing)'; l.appendChild(d); } document.querySelector('#steps').classList.add('open'); document.querySelector('#result-card').hidden = false; })()`
-      )
-      await new Promise((r) => setTimeout(r, 300))
-      const rects = await w1.webContents.executeJavaScript(
-        `JSON.stringify((() => {
-          const r = (s) => { const b = document.querySelector(s).getBoundingClientRect(); return [Math.round(b.top), Math.round(b.bottom), Math.round(b.height)] }
-          return {
-            win: [window.innerWidth, window.innerHeight],
-            chrome: r('#chrome'),
-            omnibox: r('#omnibox-row'),
-            tabstrip: r('#tabstrip'),
-            pane: r('#pane'),
-            steps: r('#steps'),
-            log: r('#log'),
-            composer: r('.composer'),
-            suggest: r('#suggest'),
-            chromeBottom: Math.round(document.querySelector('#chrome').getBoundingClientRect().bottom),
-          }
-        })())`
-      )
-      console.log(`[panel:rects] ${rects}`)
-      const img = await w1.webContents.capturePage()
-      writeFileSync('panel-shot.png', img.toPNG())
-      console.log('[panel:shot] panel-shot.png saved')
-    }, 4000)
-  }
   win.on('resize', layout)
 
   // Tab 1 is pinned: the agent's own workspace. New-tab page (ntp.html) —
@@ -289,6 +247,7 @@ async function createWindow(): Promise<void> {
   agentTab = createTab(pathToFileURL(join(__dirname, 'panel', 'ntp.html')).href, 'Agent', {
     activate: true,
     closable: false,
+    agent: true,
   })
   agentCdp = CDP.attach(new DebuggerCommand(agentTab.wc.webContents))
 
@@ -309,17 +268,23 @@ async function createWindow(): Promise<void> {
   }
 }
 
-export interface RunConfig {
-  goal: string
-  mode: 'ask' | 'allow' | 'deny'
-  domains: string[]
-  maxMs: number
-  carry: boolean
-}
-
 // Phase 6: session memory — the last goal/answer, offered as context when the
 // user continues the conversation ("now find the cheapest one").
 let lastTurn: { goal: string; answer: string } | null = null
+
+// Phase 7: the shell mirrors search engine pages into background tabs so the
+// user can watch where the agent is looking (Comet-style tab-per-search).
+// One reusable mirror tab — a fresh tab per search would pile up 5+ tabs in
+// a single run.
+let lastSearchTabId: number | null = null
+const searchMirror = (url: string, label?: string): void => {
+  const existing = lastSearchTabId !== null ? tabs.find((x) => x.id === lastSearchTabId) : undefined
+  if (existing) {
+    void existing.wc.webContents.loadURL(url)
+    return
+  }
+  lastSearchTabId = createTab(url, label ?? 'search', { activate: false, closable: true }).id
+}
 
 async function startRun(cfg: RunConfig): Promise<{ ok: boolean; error?: string }> {
   if (running) return { ok: false, error: 'a run is already active' }
@@ -345,8 +310,8 @@ async function startRun(cfg: RunConfig): Promise<{ ok: boolean; error?: string }
       context: cfg.carry && lastTurn ? `goal: ${lastTurn.goal}\nanswer: ${lastTurn.answer}` : undefined,
       // Search mirrors the engine page into a background tab (Comet-style).
       onTabOpen: (url, label) => {
-        console.log(`  (search opened a background tab: ${label})`)
-        createTab(url, label, { activate: false, closable: true })
+        console.log(`  (search mirrored into a background tab: ${label})`)
+        searchMirror(url, label)
       },
     })
     console.log(`\n=== RESULT (${run.steps} steps, ~${run.totalTokens.toLocaleString()} tokens) ===\n${run.answer}`)
@@ -366,6 +331,10 @@ async function startRun(cfg: RunConfig): Promise<{ ok: boolean; error?: string }
   } finally {
     restore()
     running = false
+    // No gate may outlive its run: deny anything still pending so a stale
+    // card can never approve an action in a later run.
+    for (const id of [...pendingGates.keys()]) pendingGates.get(id)?.(false)
+    pendingGates.clear()
   }
 }
 
@@ -378,6 +347,10 @@ ipcMain.handle('gate:decide', (_e, payload: { id: number; allow: boolean }) => {
 
 ipcMain.handle('run:stop', () => {
   cancelled = true
+  // Flush any approval card still waiting: Stop must take effect now, not
+  // after the gate's 60s timeout. Silence = deny, so a stop denies the gate.
+  for (const id of [...pendingGates.keys()]) pendingGates.get(id)?.(false)
+  pendingGates.clear()
 })
 
 ipcMain.handle('nav:go', (_e, url: string) => {
@@ -429,24 +402,6 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(async () => {
     await createWindow()
-    // SHELL_DEBUG_BOUNDS=1: dump the native contentView hierarchy after
-    // startup so view composition can be verified (views vs. chrome areas).
-    const w0 = win
-    if (process.env.SHELL_DEBUG_BOUNDS && w0) {
-      const dump = (): void => {
-        const [w, h] = w0.getContentSize()
-        console.log(`[bounds] window=${w}x${h} CHROME_H=${CHROME_H} PANE_W=${paneOpen ? PANE_W : 0} paneOpen=${paneOpen}`)
-        console.log(`[bounds] views in contentView: ${w0.contentView.children.length}`)
-        for (const v of w0.contentView.children) {
-          const b = v.getBounds()
-          const overlapping = b.x < CHROME_H && b.y < CHROME_H && b.x + b.width > 0 && b.y + b.height > 0
-          console.log(
-            `[bounds] view=${v.constructor.name} bounds=${b.x},${b.y} ${b.width}x${b.height} overlaps-chrome=${overlapping}`
-          )
-        }
-      }
-      setTimeout(dump, 3000)
-    }
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) void createWindow()
     })
