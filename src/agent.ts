@@ -63,6 +63,15 @@ export const TOOLS: ToolSchema[] = [
   {
     type: 'function',
     function: {
+      name: 'search',
+      description:
+        'Search the web for a query. Use when the goal needs pages you do not know the URL of. Returns the top results (title, URL, snippet) — then open a result.',
+      parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'done',
       description: 'End the task with the final answer. Use when the goal is met — or when you are stuck and cannot proceed.',
       parameters: { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] },
@@ -83,7 +92,9 @@ export const SYSTEM =
   'Call done when the goal is met — or when the page is ambiguous and you cannot proceed. Prefer a correct "I\'m stuck" over a wrong click. ' +
   'Never call done without a complete answer to the goal in the answer argument — gather the facts (e.g. extract) first. ' +
   'Tool calls are plain JSON function calls — never XML, markup, or code blocks. Only a real tool call (or done with an answer) is accepted. ' +
-  'If an action comes back DENIED by the safety policy, respect it: do not retry the same action; adjust the plan, find another path, or call done.'
+  'If an action comes back DENIED by the safety policy, respect it: do not retry the same action; adjust the plan, find another path, or call done. ' +
+  'Use the search tool to find pages when the goal does not name a URL — never invent URLs from memory; open the most promising search result. ' +
+  'You may emit MULTIPLE tool calls in one reply ONLY when they are read-only and independent (search, extract, scroll). navigate, click, and type change the page: at most ONE of those per reply — afterwards wait for the refreshed snapshot before acting again.'
 
 const selFor = (i: unknown) => `[data-agent-i="${String(i)}"]`
 
@@ -131,6 +142,59 @@ async function execute(cdp: CDP, name: string, args: Record<string, unknown>): P
       const priced = facts.length ? 'PRICES ON THIS PAGE:\n' + facts.join('\n') + '\n\n' : ''
       return (priced + 'PAGE TEXT:\n' + text).slice(0, 8000)
     }
+    case 'search': {
+      const q = String(args.query ?? '').trim()
+      if (!q) return 'FAILED: search requires a non-empty query'
+      // The search tool loads an engine index page (a read-only "plugin"), then
+      // stops: result pages are only reached through the gated navigate tool,
+      // so domain scoping still decides where the agent may actually act.
+      const tryEngine = async (url: string): Promise<string[]> => {
+        await cdp.navigate(url)
+        return (await cdp.evaluate(
+          `(() => {
+            const real = (h) => {
+              try {
+                const u = new URL(h)
+                const b64 = u.searchParams.get('u')
+                if (u.hostname === 'www.bing.com' && b64) {
+                  const d = atob(b64.startsWith('a1') ? b64.slice(2) : b64)
+                  if (d.startsWith('http')) return d
+                }
+              } catch {}
+              return h
+            }
+            const out = []
+            for (const li of document.querySelectorAll('li.b_algo')) {
+              const a = li.querySelector('h2 a')
+              const sn = li.querySelector('.b_caption p, .b_caption, .b_lineclamp2, .b_lineclamp3')
+              if (a) out.push((a.innerText || '').trim() + ' \u2014 ' + real(a.href || '') + (sn && sn.innerText ? ' | ' + sn.innerText.trim().slice(0, 180) : ''))
+            }
+            for (const r of document.querySelectorAll('.result')) {
+              const a = r.querySelector('.result__a')
+              const sn = r.querySelector('.result__snippet')
+              if (a) out.push((a.innerText || '').trim() + ' \u2014 ' + (a.href || '') + (sn && sn.innerText ? ' | ' + sn.innerText.trim().slice(0, 180) : ''))
+            }
+            return out.slice(0, 8)
+          })()`
+        )) as string[]
+      }
+      let results = await tryEngine(`https://www.bing.com/search?q=${encodeURIComponent(q)}`)
+      // Thin or empty results are usually a layout quirk — merge in DDG's.
+      if (results.length < 3) {
+        const ddg = await tryEngine(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`)
+        const seen = new Set(results)
+        for (const r of ddg) if (!seen.has(r)) {
+          seen.add(r)
+          results.push(r)
+        }
+      }
+      if (results.length === 0) return 'FAILED: search engines returned no results — try a different query'
+      return (
+        'SEARCH RESULTS (best first, format: title — URL | snippet):\n' +
+        results.join('\n') +
+        '\n\nYou are ON the search results page. Open a result by clicking its link, or navigate directly to a result URL.'
+      )
+    }
     default:
       return `FAILED: unknown tool ${name}`
     }
@@ -157,6 +221,9 @@ export interface AgentOptions {
   // Phase 5: the shell's Stop button. Checked between steps — an in-flight
   // action completes, the next step aborts.
   isCancelled?: () => boolean
+  // Phase 6: session memory — context from previous turns (the shell's
+  // "carry previous turn" continuation).
+  context?: string
 }
 
 // The whole agent: perceive → decide → execute, with a hard step budget.
@@ -165,11 +232,12 @@ export interface AgentOptions {
 // gets exactly what it needs to act now, not an accumulating transcript.
 const TOOL_RESULT_CAP = 2000
 const HISTORY_CAP = 20
+const MUTATING = new Set(['navigate', 'click', 'type'])
 const estimateTokens = (s: string) => Math.round(s.length / 4)
 
 export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}): Promise<AgentRun> {
   // Safety defaults: deny by default, no scope limit, no audit, 5-minute cap.
-  const { policy = denyAll, allowedDomains = [], audit, timeBudgetMs = 5 * 60_000, isCancelled } = opts
+  const { policy = denyAll, allowedDomains = [], audit, timeBudgetMs = 5 * 60_000, isCancelled, context } = opts
   const startedAt = Date.now()
   // History holds assistant turns, tool results, nudges — NOT snapshots.
   const history: ChatMessage[] = []
@@ -196,7 +264,10 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     }
     const buildContext = (): ChatMessage[] => [
       { role: 'system', content: SYSTEM },
-      { role: 'user', content: `GOAL: ${goal}` },
+      {
+        role: 'user',
+        content: `GOAL: ${goal}${context ? `\n\nCONTEXT FROM PREVIOUS TURNS:\n${context}` : ''}`,
+      },
       ...history,
       { role: 'system', content: `CURRENT SNAPSHOT (fresh):\n${snapshot.render}` },
     ]
@@ -271,6 +342,10 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
       })),
     })
 
+    // Phase 6 batching: read-only tools may share a step, but mutating tools
+    // change the page — the snapshot contract (latest snapshot is truth) means
+    // at most ONE of them per decision. Later ones fail loudly, in-band.
+    let mutated = false
     for (const tc of decision.toolCalls) {
       if (tc.name === 'done') {
         const answer = String(tc.args.answer ?? '').trim()
@@ -283,6 +358,15 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
         console.log(`  -> done(${answer.slice(0, 200)})`)
         return { answer, steps: step, totalTokens, gated, denied }
       }
+
+      // Batched mutating calls after the first one operate on a stale page.
+      if (MUTATING.has(tc.name) && mutated) {
+        const stale = 'FAILED: the page changed earlier in this step, so this index/URL is stale. The latest snapshot is truth — act on it in the NEXT step, one change per step.'
+        console.log(`  -> ${tc.name}(${JSON.stringify(tc.args).slice(0, 120)}) — FAILED (stale: page already changed this step)`)
+        push({ role: 'tool', tool_call_id: tc.id, content: stale })
+        continue
+      }
+      if (MUTATING.has(tc.name)) mutated = true
 
       // Phase 4: every action crosses the gate first. A denied action goes
       // back to the model as a refusal — never executed, never retried.

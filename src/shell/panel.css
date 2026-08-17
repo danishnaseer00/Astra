@@ -53,8 +53,10 @@ textarea { resize: none; padding: 6px 7px; }
 .config-row input#domains { flex: 1; min-width: 0; }
 .config-row input#maxms { width: 92px; }
 
-.run-row { display: flex; gap: 6px; }
+.run-row { display: flex; gap: 6px; align-items: stretch; }
 .run-row button { flex: 1; padding: 6px 0; cursor: pointer; }
+.run-row .carry { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #8a919e; white-space: nowrap; }
+.carry input { accent-color: #2453a4; }
 button.primary { background: #2453a4; border-color: #2f66c4; font-weight: 600; }
 button.primary:hover { background: #2b5fba; }
 button.primary:disabled { opacity: 0.5; cursor: default; }

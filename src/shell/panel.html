@@ -27,12 +27,15 @@
       <option value="allow">allow all</option>
     </select>
     <input id="domains" type="text" placeholder="domains: a.com,b.com" spellcheck="false">
-    <input id="maxms" type="number" value="300000" title="time budget (ms)">
+    <input id="maxms" type="number" value="600000" title="time budget (ms)">
   </div>
 
   <div class="run-row">
     <button id="run" class="primary">Run</button>
     <button id="stop" hidden>Stop</button>
+    <label class="carry" title="include the previous goal and answer as context">
+      <input id="carry" type="checkbox" checked> carry prev
+    </label>
   </div>
 
   <pre id="log"></pre>

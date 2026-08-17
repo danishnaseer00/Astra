@@ -51,7 +51,8 @@ runBtn.addEventListener('click', async () => {
     goal,
     mode: modeEl.value,
     domains: domainsEl.value.split(',').map((s) => s.trim()).filter(Boolean),
-    maxMs: Number(maxMsEl.value) || 300000,
+    maxMs: Number(maxMsEl.value) || 600000,
+    carry: $('#carry').checked,
   })
   if (res && !res.ok) {
     appendLog(`ERROR: ${res.error}`)

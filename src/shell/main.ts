@@ -116,7 +116,7 @@ async function createWindow(): Promise<void> {
   const smokeGoal = process.env.SHELL_SMOKE_GOAL
   if (smokeGoal) {
     view.webContents.once('did-finish-load', () => {
-      void startRun({ goal: smokeGoal, mode: process.env.SHELL_SMOKE_MODE === 'ask' ? 'ask' : 'deny', domains: [], maxMs: 240_000 })
+      void startRun({ goal: smokeGoal, mode: process.env.SHELL_SMOKE_MODE === 'ask' ? 'ask' : 'deny', domains: [], maxMs: 600_000, carry: false })
     })
   }
 }
@@ -126,7 +126,12 @@ export interface RunConfig {
   mode: 'ask' | 'allow' | 'deny'
   domains: string[]
   maxMs: number
+  carry: boolean
 }
+
+// Phase 6: session memory — the last goal/answer, offered as context when the
+// user continues the conversation ("now find the cheapest one").
+let lastTurn: { goal: string; answer: string } | null = null
 
 async function startRun(cfg: RunConfig): Promise<{ ok: boolean; error?: string }> {
   if (running) return { ok: false, error: 'a run is already active' }
@@ -149,9 +154,11 @@ async function startRun(cfg: RunConfig): Promise<{ ok: boolean; error?: string }
       audit,
       timeBudgetMs: cfg.maxMs || 5 * 60_000,
       isCancelled: () => cancelled,
+      context: cfg.carry && lastTurn ? `goal: ${lastTurn.goal}\nanswer: ${lastTurn.answer}` : undefined,
     })
     console.log(`\n=== RESULT (${run.steps} steps, ~${run.totalTokens.toLocaleString()} tokens) ===\n${run.answer}`)
     console.log(`\nSafety: ${run.gated} gated, ${run.denied} denied — full audit in logs/audit.jsonl`)
+    lastTurn = { goal: cfg.goal, answer: run.answer }
     sendToPanel('run:done', run)
     return { ok: true }
   } finally {
