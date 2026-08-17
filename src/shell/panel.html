@@ -2,54 +2,108 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self' 'unsafe-inline'; img-src data:; font-src 'self'; script-src 'self'">
 <title>agentic-browser-comet</title>
+<link rel="stylesheet" href="fonts/fonts.css">
 <link rel="stylesheet" href="panel.css">
 </head>
-<body>
-  <header>
-    <h1>agentic-browser-comet</h1>
-    <div class="status"><span id="status-dot" class="dot idle"></span><span id="status-text">idle</span></div>
-  </header>
-
-  <div class="url-row">
-    <input id="url" type="text" placeholder="URL" value="https://books.toscrape.com" spellcheck="false">
-    <button id="go">Go</button>
-  </div>
-
-  <textarea id="goal" rows="3" spellcheck="false"
-    >Find the cheapest book in the Travel category on books.toscrape.com and report its title and price.</textarea>
-
-  <div class="config-row">
-    <select id="mode" title="gate policy">
-      <option value="deny">deny (default)</option>
-      <option value="ask">ask (approval cards)</option>
-      <option value="allow">allow all</option>
-    </select>
-    <input id="domains" type="text" placeholder="domains: a.com,b.com" spellcheck="false">
-    <input id="maxms" type="number" value="600000" title="time budget (ms)">
-  </div>
-
-  <div class="run-row">
-    <button id="run" class="primary">Run</button>
-    <button id="stop" hidden>Stop</button>
-    <label class="carry" title="include the previous goal and answer as context">
-      <input id="carry" type="checkbox" checked> carry prev
-    </label>
-  </div>
-
-  <pre id="log"></pre>
-
-  <div id="gate" class="gate" hidden>
-    <div class="gate-title">Safety gate — approve?</div>
-    <div id="gate-summary"></div>
-    <div class="gate-buttons">
-      <button id="deny" class="deny">Deny</button>
-      <button id="allow" class="allow">Allow</button>
+<body data-theme="dark">
+  <div id="chrome">
+    <div id="omnibox-row">
+      <span class="brand" title="agentic-browser-comet"></span>
+      <div class="navs">
+        <button id="back" class="navbtn" title="Back" disabled>
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>
+        </button>
+        <button id="forward" class="navbtn" title="Forward" disabled>
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M4 11h12.17l-5.59-5.59L12 4l8 8-8 8-1.41-1.41L16.17 13H4v-2z"/></svg>
+        </button>
+        <button id="reload" class="navbtn" title="Reload">
+          <svg viewBox="0 0 24 24"><path fill="currentColor" d="M17.65 6.35A7.95 7.95 0 0 0 12.04 4a8 8 0 1 0 7.68 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+        </button>
+      </div>
+      <div class="omnibox">
+        <svg class="om-ic" viewBox="0 0 24 24"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z"/></svg>
+        <input id="omnibox-input" placeholder="Search or enter URL..." spellcheck="false" autocomplete="off">
+      </div>
+      <div class="strip-actions">
+        <button id="theme-toggle" title="Toggle dark / light mode" aria-label="Toggle theme">
+          <svg id="theme-sun" class="theme-ic" viewBox="0 0 24 24" hidden><path fill="currentColor" d="M12 7a5 5 0 1 0 0 10 5 5 0 0 0 0-10zm0-5a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0V3a1 1 0 0 1 1-1zm0 16a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0v-2a1 1 0 0 1 1-1zM4.22 4.22a1 1 0 0 1 1.41 0l1.42 1.42a1 1 0 0 1-1.42 1.42L4.22 5.64a1 1 0 0 1 0-1.42zm12.73 12.73a1 1 0 0 1 1.41 0l1.42 1.42a1 1 0 0 1-1.42 1.42l-1.42-1.42a1 1 0 0 1 0-1.41zM2 12a1 1 0 0 1 1-1h2a1 1 0 1 1 0 2H3a1 1 0 0 1-1-1zm16 0a1 1 0 0 1 1-1h2a1 1 0 1 1 0 2h-2a1 1 0 0 1-1-1zM4.22 19.78a1 1 0 0 1 0-1.41l1.42-1.42a1 1 0 0 1 1.42 1.42l-1.42 1.42a1 1 0 0 1-1.42 0zm12.73-12.73a1 1 0 0 1 0-1.41l1.42-1.42a1 1 0 0 1 1.42 1.42l-1.42 1.42a1 1 0 0 1-1.42 0z"/></svg>
+          <svg id="theme-moon" class="theme-ic" viewBox="0 0 24 24" hidden><path fill="currentColor" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+        <button id="pane-toggle" title="Agent pane" class="pane-ic">»</button>
+      </div>
+    </div>
+    <div id="tabstrip">
+      <div id="tabs"></div>
+      <button id="newtab" title="New tab">+</button>
     </div>
   </div>
 
-  <div id="result" class="result" hidden></div>
+  <aside id="pane" class="open">
+    <div class="pane-head">
+      <span class="pane-title">Agent</span>
+      <span class="pane-status"><span id="status-dot" class="dot idle"></span><span id="status-text">idle</span></span>
+    </div>
+
+    <details id="settings" class="config">
+      <summary>Run settings</summary>
+      <div class="config-grid">
+        <select id="mode" title="gate policy">
+          <option value="deny">deny</option>
+          <option value="ask" selected>ask</option>
+          <option value="allow">allow</option>
+        </select>
+        <input id="domains" type="text" placeholder="domains: a.com,b.com" spellcheck="false">
+        <input id="maxms" type="number" value="600000" title="time budget (ms)">
+        <label class="carry" title="include the previous goal and answer as context">
+          <input id="carry" type="checkbox" checked> carry prev
+        </label>
+      </div>
+    </details>
+
+    <section id="suggest" class="card suggest-card">
+      <div class="card-title">What can I do?</div>
+      <p class="suggest-p">Give me a task and I'll browse, search, and report back.</p>
+      <ul class="suggest-ex">
+        <li>Find the cheapest book in the Travel category on books.toscrape.com</li>
+        <li>How much does Perplexity Pro cost? Compare with ChatGPT Plus.</li>
+      </ul>
+    </section>
+
+    <section id="result-card" class="card result-card" hidden>
+      <div class="card-title result-title">Result</div>
+      <div id="result-answer" class="result-answer"></div>
+      <div id="result-stats" class="result-stats"></div>
+    </section>
+
+    <section id="steps" class="steps">
+      <div id="steps-head" class="steps-head" role="button" tabindex="0" title="Toggle steps log">
+        <span>Steps &amp; tokens</span>
+        <span id="step-count"></span>
+      </div>
+      <pre id="log"></pre>
+    </section>
+
+    <div class="composer">
+      <input id="ask" class="ask-input" placeholder="Type a task..." spellcheck="false" autocomplete="off">
+      <button id="run" class="ask-go" title="Run" hidden>
+        <svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8z"/></svg>
+      </button>
+      <button id="stop" class="ask-stop" title="Stop" hidden>
+        <svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 7h10v10H7z"/></svg>
+      </button>
+    </div>
+
+    <div id="gate" class="gate" hidden>
+      <div class="gate-title">Safety gate — approve?</div>
+      <div id="gate-summary"></div>
+      <div class="gate-buttons">
+        <button id="deny" class="deny">Deny</button>
+        <button id="allow" class="allow">Allow</button>
+      </div>
+    </div>
+  </aside>
 
 <script src="panel.js"></script>
 </body>

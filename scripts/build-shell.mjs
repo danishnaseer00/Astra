@@ -30,8 +30,9 @@ await build({
   logLevel: 'warning',
 })
 
-for (const f of ['panel.html', 'panel.css', 'panel.js']) {
+for (const f of ['panel.html', 'panel.css', 'panel.js', 'ntp.html']) {
   cpSync(join('src', 'shell', f), join(dist, 'panel', f))
 }
+cpSync(join('src', 'shell', 'fonts'), join(dist, 'panel', 'fonts'), { recursive: true })
 
 console.log('shell built → dist/')

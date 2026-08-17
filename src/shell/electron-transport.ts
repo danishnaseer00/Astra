@@ -19,7 +19,14 @@ export class DebuggerCommand implements CdpCommand {
     try {
       // webContents.debugger resolves with the result directly (unlike the
       // WebSocket door, responses carry no id) and rejects on CDP errors.
-      const result = await this.wc.debugger.sendCommand(method, params)
+      // A dead debugger session NEVER settles — race it with a timeout so a
+      // wedged page fails loudly instead of hanging the whole agent.
+      const result = await Promise.race([
+        this.wc.debugger.sendCommand(method, params),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`CDP timeout after 15s: ${method}`)), 15_000)
+        ),
+      ])
       return { result }
     } catch (err) {
       return { error: { message: err instanceof Error ? err.message : String(err) } }

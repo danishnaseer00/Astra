@@ -4,3 +4,4 @@ dist/
 *.png
 .env
 logs/
+smoke-*.txt

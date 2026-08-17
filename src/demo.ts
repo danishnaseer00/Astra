@@ -1,4 +1,3 @@
-// demo.ts — Phase 0 win: launch Chrome, connect over CDP, read + shoot.
 import { launchChrome, waitForPort, CDP, killChrome } from './browser.ts'
 
 const { proc, port } = launchChrome({})

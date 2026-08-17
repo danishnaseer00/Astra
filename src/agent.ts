@@ -5,10 +5,10 @@ import type { CDP } from './browser.ts'
 import { sleep } from './browser.ts'
 import { buildSnapshot, type Snapshot } from './perceive.ts'
 import { scrubPii } from './perceive.ts'
-import { chatWithTools, type ChatMessage, type ToolSchema } from './llm.ts'
+import { chatWithTools, type ChatMessage, type ChatWithToolsResult, type ToolSchema } from './llm.ts'
 import { gate, cleanUrl, denyAll, sanitizeArgs, type AuditLog, type Policy } from './safety.ts'
 
-export const BUDGET = 12
+export const BUDGET = 24
 
 // The six-tool vocabulary from lesson 5. Few and stable.
 export const TOOLS: ToolSchema[] = [
@@ -100,7 +100,7 @@ const selFor = (i: unknown) => `[data-agent-i="${String(i)}"]`
 
 // Execute one tool call against the browser; returns what the model gets back.
 // A tool that throws must fail loudly as a tool result — never crash the loop.
-async function execute(cdp: CDP, name: string, args: Record<string, unknown>): Promise<string> {
+async function execute(cdp: CDP, name: string, args: Record<string, unknown>, opts?: AgentOptions): Promise<string> {
   try {
     switch (name) {
     case 'navigate': {
@@ -178,10 +178,14 @@ async function execute(cdp: CDP, name: string, args: Record<string, unknown>): P
           })()`
         )) as string[]
       }
+      let engineUrl = ''
       let results = await tryEngine(`https://www.bing.com/search?q=${encodeURIComponent(q)}`)
+      if (results.length > 0) engineUrl = `https://www.bing.com/search?q=${encodeURIComponent(q)}`
       // Thin or empty results are usually a layout quirk — merge in DDG's.
       if (results.length < 3) {
-        const ddg = await tryEngine(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`)
+        const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`
+        const ddg = await tryEngine(ddgUrl)
+        if (ddg.length > 0) engineUrl = ddgUrl
         const seen = new Set(results)
         for (const r of ddg) if (!seen.has(r)) {
           seen.add(r)
@@ -189,6 +193,11 @@ async function execute(cdp: CDP, name: string, args: Record<string, unknown>): P
         }
       }
       if (results.length === 0) return 'FAILED: search engines returned no results — try a different query'
+      // The shell mirrors the engine page into a background tab (Comet-style),
+      // so the user can watch the search that produced these results.
+      try {
+        opts?.onTabOpen?.(engineUrl, `search: ${q.slice(0, 22)}`)
+      } catch { /* the shell must never break a search */ }
       return (
         'SEARCH RESULTS (best first, format: title — URL | snippet):\n' +
         results.join('\n') +
@@ -224,6 +233,9 @@ export interface AgentOptions {
   // Phase 6: session memory — context from previous turns (the shell's
   // "carry previous turn" continuation).
   context?: string
+  // Phase 7: the shell mirrors search engine pages into background tabs so the
+  // user can watch where the agent is looking (Comet-style tab-per-search).
+  onTabOpen?: (url: string, label?: string) => void
 }
 
 // The whole agent: perceive → decide → execute, with a hard step budget.
@@ -244,10 +256,29 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
   let totalTokens = 0
   let gated = 0
   let denied = 0
+  let challengeClicks = 0
 
   const push = (msg: ChatMessage) => {
     history.push(msg)
     if (history.length > HISTORY_CAP) history.splice(0, history.length - HISTORY_CAP)
+  }
+
+  // Loop detection: navigation targets the agent keeps revisiting without
+  // progress burn steps and the budget. Track visit counts; once a URL is
+  // visited 3+ times, nudge the model ONCE to stop and use what it has.
+  // The nudge rides inside the snapshot system message — a user message would
+  // sit directly after a tool result, which Mistral's API rejects (400).
+  const navVisits = new Map<string, number>()
+  const navNudged = new Set<string>()
+  let pendingNudge = ''
+  const nudgeIfLooping = () => {
+    for (const [url, n] of navVisits) {
+      if (n >= 3 && !navNudged.has(url)) {
+        navNudged.add(url)
+        pendingNudge = `\nNOTE: You are looping — you have navigated to ${url} ${n} times and it is not yielding usable content. STOP re-visiting it. Answer from facts you already have (search results, earlier extracts) with done(answer), or use search to find a completely different source.\n`
+        console.log(`  !! loop nudge: ${url} visited ${n} times`)
+      }
+    }
   }
 
   for (let step = 1; step <= BUDGET; step++) {
@@ -262,6 +293,22 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
       const why = err instanceof Error ? err.message : String(err)
       return { answer: `[agent stuck: could not perceive the page — ${why}]`, steps: step, totalTokens, gated, denied }
     }
+    // Bounded challenge auto-click: tick the Turnstile checkbox by dispatching
+    // a TRUSTED click at the iframe's center (cross-origin blocks JS, not
+    // input events). If it doesn't clear in two tries, stop and let the model
+    // route around — never burn the budget on a bot wall.
+    if (snapshot.challengeRect && challengeClicks < 2) {
+      challengeClicks++
+      const { x, y } = snapshot.challengeRect
+      console.log(`  !! auto-clicking challenge checkbox at ${x},${y} (try ${challengeClicks}/2)`)
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 }).catch(() => {})
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 }).catch(() => {})
+      await sleep(2500)
+      continue
+    }
+    // Loop detection runs BEFORE the context is built, so the nudge reaches
+    // the model this very step instead of one step later.
+    nudgeIfLooping()
     const buildContext = (): ChatMessage[] => [
       { role: 'system', content: SYSTEM },
       {
@@ -269,7 +316,7 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
         content: `GOAL: ${goal}${context ? `\n\nCONTEXT FROM PREVIOUS TURNS:\n${context}` : ''}`,
       },
       ...history,
-      { role: 'system', content: `CURRENT SNAPSHOT (fresh):\n${snapshot.render}` },
+      { role: 'system', content: `CURRENT SNAPSHOT (fresh):\n${snapshot.render}${pendingNudge}` },
     ]
 
     const stepTokens = estimateTokens(JSON.stringify(buildContext()))
@@ -277,49 +324,58 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     console.log(`\n--- step ${step} (${snapshot.elements.length} elements, ~${stepTokens.toLocaleString()} tokens) ---`)
 
     const decide = async () => chatWithTools(buildContext(), TOOLS)
-    let decision = await decide()
-
-    // Failure mode: models sometimes reply with plain text (or schema-echo junk)
-    // instead of a tool call. Lesson 5's contract: only done(answer) ends a task.
-    // Reject non-tool replies with a nudge, bounded, then stop gracefully.
-    const notAToolReply = (s: string) => !s.trim() || s.includes('</') // empty, or schema-echo junk
-    // Escalating nudges: free-tier gateways intermittently drop into a DSML
-    // schema-echo loop where only a concrete example breaks them out.
-    const NUDGES = [
-      'Your last reply was not acceptable: it must be a tool call, or done(answer) with the final answer. Plain text is not accepted. Try again.',
-      'Your last reply was still not acceptable. Emit exactly one tool call in the documented format — nothing else. If the goal is met, use done(answer) with the complete final answer.',
-      'A tool call looks like ONLY this: {"name": "click", "arguments": {"index": 3}} — or done with a non-empty answer. Emit one call now. No prose, no XML or markup tags.',
-    ]
-    for (let retry = 0; retry < NUDGES.length && decision.toolCalls.length === 0 && notAToolReply(decision.content); retry++) {
-      console.log(`  (non-tool reply: ${JSON.stringify(decision.content.slice(0, 60))} — nudging #${retry + 1})`)
-      push({ role: 'system', content: NUDGES[retry] })
-      if (retry > 0) await sleep(800) // pace retries; gateways misbehave under back-to-back load
+    // The free-tier gateway can fail mid-run (429 concurrency, timeouts). The
+    // loop must degrade to a truthful failure message, never crash.
+    let decision: ChatWithToolsResult
+    try {
       decision = await decide()
-    }
-    // Glitch mode survives nudges because the poisoned history keeps steering
-    // it. Fresh start — no history, no nudges, explicit JSON example — is the
-    // strongest escape, so it runs for ANY non-tool reply, not just junk.
-    if (decision.toolCalls.length === 0) {
-      console.log('  (plain-text reply — retrying with minimal context)')
-      const minimal = (showExample: boolean): ChatMessage[] => [
-        { role: 'system', content: SYSTEM },
-        {
-          role: 'user',
-          content: showExample
-            ? `GOAL: ${goal}\n\n` +
-              'Reply with exactly one tool call in this JSON shape — no prose, no XML:\n' +
-              '{"name": "click", "arguments": {"index": 3}}\n\n' +
-              snapshot.render
-            : `GOAL: ${goal}\n\n${snapshot.render}`,
-        },
+
+      // Failure mode: models sometimes reply with plain text (or schema-echo junk)
+      // instead of a tool call. Lesson 5's contract: only done(answer) ends a task.
+      // Reject non-tool replies with a nudge, bounded, then stop gracefully.
+      const notAToolReply = (s: string) => !s.trim() || s.includes('</') // empty, or schema-echo junk
+      // Escalating nudges: free-tier gateways intermittently drop into a DSML
+      // schema-echo loop where only a concrete example breaks them out.
+      const NUDGES = [
+        'Your last reply was not acceptable: it must be a tool call, or done(answer) with the final answer. Plain text is not accepted. Try again.',
+        'Your last reply was still not acceptable. Emit exactly one tool call in the documented format — nothing else. If the goal is met, use done(answer) with the complete final answer.',
+        'A tool call looks like ONLY this: {"name": "click", "arguments": {"index": 3}} — or done with a non-empty answer. Emit one call now. No prose, no XML or markup tags.',
       ]
-      for (let i = 0; i < 3 && decision.toolCalls.length === 0; i++) {
-        if (i > 0) {
-          console.log(`  (minimal retry ${i + 1}/3)`)
-          await sleep(1500) // dodge transient gateway load
-        }
-        decision = await chatWithTools(minimal(i % 2 === 0), TOOLS)
+      for (let retry = 0; retry < NUDGES.length && decision.toolCalls.length === 0 && notAToolReply(decision.content); retry++) {
+        console.log(`  (non-tool reply: ${JSON.stringify(decision.content.slice(0, 60))} — nudging #${retry + 1})`)
+        push({ role: 'system', content: NUDGES[retry] })
+        if (retry > 0) await sleep(800) // pace retries; gateways misbehave under back-to-back load
+        decision = await decide()
       }
+      // Glitch mode survives nudges because the poisoned history keeps steering
+      // it. Fresh start — no history, no nudges, explicit JSON example — is the
+      // strongest escape, so it runs for ANY non-tool reply, not just junk.
+      if (decision.toolCalls.length === 0) {
+        console.log('  (plain-text reply — retrying with minimal context)')
+        const minimal = (showExample: boolean): ChatMessage[] => [
+          { role: 'system', content: SYSTEM },
+          {
+            role: 'user',
+            content: showExample
+              ? `GOAL: ${goal}\n\n` +
+                'Reply with exactly one tool call in this JSON shape — no prose, no XML:\n' +
+                '{"name": "click", "arguments": {"index": 3}}\n\n' +
+                snapshot.render
+              : `GOAL: ${goal}\n\n${snapshot.render}`,
+          },
+        ]
+        for (let i = 0; i < 3 && decision.toolCalls.length === 0; i++) {
+          if (i > 0) {
+            console.log(`  (minimal retry ${i + 1}/3)`)
+            await sleep(1500) // dodge transient gateway load
+          }
+          decision = await chatWithTools(minimal(i % 2 === 0), TOOLS)
+        }
+      }
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err)
+      console.log(`  !! LLM API failed — ${why}`)
+      return { answer: `[agent stuck: the model API failed (${why}). Wait a moment, then run again.]`, steps: step, totalTokens, gated, denied }
     }
     if (decision.toolCalls.length === 0) {
       const raw = decision.content.trim()
@@ -370,8 +426,10 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
 
       // Phase 4: every action crosses the gate first. A denied action goes
       // back to the model as a refusal — never executed, never retried.
+      console.log(`[agent:gate] ${tc.name}(${JSON.stringify(tc.args).slice(0, 80)})`)
       const verdict = await gate(cdp, tc.name, tc.args, allowedDomains, policy)
       const atUrl = audit ? ((await cdp.evaluate('location.href').catch(() => '')) as string) : ''
+      console.log(`[agent:gate] verdict=${verdict.allowed ? 'allowed' : 'denied'} gated=${verdict.gated}`)
       if (verdict.gated) {
         gated++
         if (!verdict.allowed) denied++
@@ -397,7 +455,11 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
         if (!verdict.allowed) continue
       }
 
-      const result = await execute(cdp, tc.name, tc.args)
+      const result = await execute(cdp, tc.name, tc.args, opts)
+      if (tc.name === 'navigate') {
+        const url = String(tc.args.url ?? '')
+        navVisits.set(url, (navVisits.get(url) ?? 0) + 1)
+      }
       audit?.append({
         ts: new Date().toISOString(),
         step,
