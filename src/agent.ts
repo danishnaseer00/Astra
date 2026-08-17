@@ -154,6 +154,9 @@ export interface AgentOptions {
   allowedDomains?: string[]
   audit?: AuditLog
   timeBudgetMs?: number
+  // Phase 5: the shell's Stop button. Checked between steps — an in-flight
+  // action completes, the next step aborts.
+  isCancelled?: () => boolean
 }
 
 // The whole agent: perceive → decide → execute, with a hard step budget.
@@ -166,7 +169,7 @@ const estimateTokens = (s: string) => Math.round(s.length / 4)
 
 export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}): Promise<AgentRun> {
   // Safety defaults: deny by default, no scope limit, no audit, 5-minute cap.
-  const { policy = denyAll, allowedDomains = [], audit, timeBudgetMs = 5 * 60_000 } = opts
+  const { policy = denyAll, allowedDomains = [], audit, timeBudgetMs = 5 * 60_000, isCancelled } = opts
   const startedAt = Date.now()
   // History holds assistant turns, tool results, nudges — NOT snapshots.
   const history: ChatMessage[] = []
@@ -180,6 +183,7 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
   }
 
   for (let step = 1; step <= BUDGET; step++) {
+    if (isCancelled?.()) return { answer: '[cancelled] task stopped by the user', steps: step, totalTokens, gated, denied }
     if (Date.now() - startedAt > timeBudgetMs) {
       return { answer: '[time budget exhausted] task incomplete', steps: step, totalTokens, gated, denied }
     }

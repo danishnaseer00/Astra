@@ -4,7 +4,14 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const CHROME_PATH = process.env.CHROME_PATH ?? 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe'
-const APP_ROOT = fileURLToPath(new URL('..', import.meta.url))
+// In the ESM CLI runs this is the project root; the CJS Electron bundle has no
+// import.meta.url (esbuild leaves it empty), so fall back to the working dir.
+let APP_ROOT: string
+try {
+  APP_ROOT = fileURLToPath(new URL('..', import.meta.url))
+} catch {
+  APP_ROOT = process.cwd()
+}
 const PROFILES_DIR = join(APP_ROOT, 'profiles')
 
 export interface LaunchedChrome {
@@ -70,16 +77,52 @@ export async function listTargets(port: number): Promise<TargetInfo[]> {
   return (await res.json()) as TargetInfo[]
 }
 
-type CdpMessage = { id?: number; result?: any; error?: { message: string } }
+export type CdpMessage = { id?: number; result?: any; error?: { message: string } }
+
+// One CDP door: commands in, {result|error} out. The WebSocket transport talks
+// to a real Chrome over a port (lesson 4); the Electron shell supplies a
+// transport over webContents.debugger (lesson 6) — same wire, two doors.
+export interface CdpCommand {
+  send(method: string, params: Record<string, unknown>): Promise<CdpMessage>
+  close(): void
+}
+
+// The lesson-4 door: JSON-RPC over WebSocket, responses matched by id.
+class WebSocketCommand implements CdpCommand {
+  private nextId = 0
+  private pending = new Map<number, (msg: CdpMessage) => void>()
+  private ws: WebSocket
+
+  constructor(ws: WebSocket) {
+    this.ws = ws
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(String(e.data)) as CdpMessage
+      if (msg.id && this.pending.has(msg.id)) {
+        this.pending.get(msg.id)!(msg)
+        this.pending.delete(msg.id)
+      }
+    }
+  }
+
+  send(method: string, params: Record<string, unknown> = {}): Promise<CdpMessage> {
+    return new Promise((resolve) => {
+      const id = ++this.nextId
+      this.pending.set(id, resolve)
+      this.ws.send(JSON.stringify({ id, method, params }))
+    })
+  }
+
+  close(): void {
+    this.ws.close()
+  }
+}
 
 // The whole control plane from lesson 4, as a class.
 export class CDP {
-  private ws: WebSocket
-  private nextId = 0
-  private pending = new Map<number, (msg: CdpMessage) => void>()
+  private cmd: CdpCommand
 
-  private constructor(ws: WebSocket) {
-    this.ws = ws
+  private constructor(cmd: CdpCommand) {
+    this.cmd = cmd
   }
 
   // Discover a page target over HTTP, then open the WebSocket door.
@@ -89,15 +132,8 @@ export class CDP {
     if (!target?.webSocketDebuggerUrl) throw new Error(`No ${targetType} target found on port ${port}`)
 
     const ws = new WebSocket(target.webSocketDebuggerUrl)
-    const cdp = new CDP(ws)
+    const cdp = new CDP(new WebSocketCommand(ws))
 
-    ws.onmessage = (e) => {
-      const msg = JSON.parse(String(e.data)) as CdpMessage
-      if (msg.id && cdp.pending.has(msg.id)) {
-        cdp.pending.get(msg.id)!(msg)
-        cdp.pending.delete(msg.id)
-      }
-    }
     await new Promise<void>((resolve, reject) => {
       ws.onopen = () => resolve()
       ws.onerror = () => reject(new Error('WebSocket connection failed'))
@@ -105,13 +141,18 @@ export class CDP {
     return cdp
   }
 
+  // The lesson-6 door: a transport over webContents.debugger from the shell.
+  static attach(cmd: CdpCommand): CDP {
+    return new CDP(cmd)
+  }
+
   // JSON-RPC: {id, method, params} in, matching {id, result} out.
   send(method: string, params: Record<string, unknown> = {}): Promise<CdpMessage> {
-    return new Promise((resolve) => {
-      const id = ++this.nextId
-      this.pending.set(id, resolve)
-      this.ws.send(JSON.stringify({ id, method, params }))
-    })
+    return this.cmd.send(method, params)
+  }
+
+  close(): void {
+    this.cmd.close()
   }
 
   // Run JS inside the page — the agent's direct line to the DOM.
@@ -129,10 +170,6 @@ export class CDP {
     await this.send('Page.enable')
     const msg = await this.send('Page.captureScreenshot', { format: 'png' })
     writeFileSync(outPath, Buffer.from(msg.result.data, 'base64'))
-  }
-
-  close(): void {
-    this.ws.close()
   }
 
   // === Phase 1: the actor — real, trusted input events ===

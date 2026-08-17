@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self'">
+<title>agentic-browser-comet</title>
+<link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <header>
+    <h1>agentic-browser-comet</h1>
+    <div class="status"><span id="status-dot" class="dot idle"></span><span id="status-text">idle</span></div>
+  </header>
+
+  <div class="url-row">
+    <input id="url" type="text" placeholder="URL" value="https://books.toscrape.com" spellcheck="false">
+    <button id="go">Go</button>
+  </div>
+
+  <textarea id="goal" rows="3" spellcheck="false"
+    >Find the cheapest book in the Travel category on books.toscrape.com and report its title and price.</textarea>
+
+  <div class="config-row">
+    <select id="mode" title="gate policy">
+      <option value="deny">deny (default)</option>
+      <option value="ask">ask (approval cards)</option>
+      <option value="allow">allow all</option>
+    </select>
+    <input id="domains" type="text" placeholder="domains: a.com,b.com" spellcheck="false">
+    <input id="maxms" type="number" value="300000" title="time budget (ms)">
+  </div>
+
+  <div class="run-row">
+    <button id="run" class="primary">Run</button>
+    <button id="stop" hidden>Stop</button>
+  </div>
+
+  <pre id="log"></pre>
+
+  <div id="gate" class="gate" hidden>
+    <div class="gate-title">Safety gate — approve?</div>
+    <div id="gate-summary"></div>
+    <div class="gate-buttons">
+      <button id="deny" class="deny">Deny</button>
+      <button id="allow" class="allow">Allow</button>
+    </div>
+  </div>
+
+  <div id="result" class="result" hidden></div>
+
+<script src="panel.js"></script>
+</body>
+</html>
