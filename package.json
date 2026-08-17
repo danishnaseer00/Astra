@@ -1,0 +1,18 @@
+{
+  "name": "agentic-browser",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "demo": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/demo.ts",
+    "actor": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/actor.ts",
+    "perceive": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/perceive-cli.ts",
+    "agent": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/agent-cli.ts",
+    "agent-ask": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/agent-cli.ts --ask",
+    "safety": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/safety-cli.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
+}
