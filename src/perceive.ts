@@ -65,7 +65,7 @@ export async function buildSnapshot(cdp: CDP): Promise<Snapshot> {
         bodyText: document.body ? (() => {
           const t = document.body.innerText
           if (t.length <= 2000) return t
-          return t.slice(0, 1400) + '\n...[middle ' + (t.length - 2000) + ' chars omitted]...\n' + t.slice(-600)
+          return t.slice(0, 1400) + '\\n...[middle ' + (t.length - 2000) + ' chars omitted]...\\n' + t.slice(-600)
         })() : '',
         challengeRect: (() => {
           const f = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], iframe[src*="cf-chl"], iframe[title*="challenge" i]')
