@@ -311,6 +311,7 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
   const actionCounts = new Map<string, number>()
   const actionNudged = new Set<string>()
   let pendingNudge = ''
+  let budgetNudged = false
   const bumpAction = (kind: 'nav' | 'search' | 'extract', key: string): void => {
     const k = `${kind}:${key}`
     actionCounts.set(k, (actionCounts.get(k) ?? 0) + 1)
@@ -338,6 +339,18 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     if (isCancelled?.()) return { answer: '[cancelled] task stopped by the user' + gatheredTail(), steps: step, totalTokens, gated, denied }
     if (Date.now() - startedAt > timeBudgetMs) {
       return { answer: '[time budget exhausted] task incomplete' + gatheredTail(), steps: step, totalTokens, gated, denied }
+    }
+    // Budget-pressure nudge: exploration tasks (T6, T14) used to burn all 24
+    // steps wandering or re-scanning, then exhaust without an answer. Once the
+    // budget is low, push the model EVERY step to synthesize and call done —
+    // unless a loop nudge is already queued (it is equally urgent). One-shot
+    // didn't work (T12): the model ignored a single hint and kept paginating.
+    if (BUDGET - step <= 6 && !pendingNudge) {
+      if (!budgetNudged) {
+        budgetNudged = true
+        console.log(`  !! budget nudge: ${BUDGET - step} steps left — synthesize now`)
+      }
+      pendingNudge = `\nNOTE: Your step budget is almost gone (${BUDGET - step} steps left). STOP exploring — call done(answer) NOW with what you have. If the goal cannot be met (for example, no matching book exists), call done() with a clear statement of what you checked and what you found — a negative result is a valid, complete answer.\n`
     }
     let snapshot: Snapshot
     try {

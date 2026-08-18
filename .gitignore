@@ -6,3 +6,5 @@ dist/
 logs/
 smoke-*.txt
 smoke-*.log
+task.md
+architecture.md
