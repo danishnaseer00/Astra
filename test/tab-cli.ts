@@ -3,7 +3,7 @@
 // npm run tab-test
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { launchChrome, waitForPort, CDP, killChrome, CliTabHost } from './browser.ts'
+import { launchChrome, waitForPort, CDP, killChrome, CliTabHost } from '../src/browser.ts'
 import { serveTestDir } from './test-server.ts'
 
 let pass = 0

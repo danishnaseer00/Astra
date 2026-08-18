@@ -4,9 +4,9 @@
 // answers. npm run vision-test
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { launchChrome, waitForPort, CDP, killChrome } from './browser.ts'
-import { buildSnapshot } from './perceive.ts'
-import { solveChallenge } from './vision.ts'
+import { launchChrome, waitForPort, CDP, killChrome } from '../src/browser.ts'
+import { buildSnapshot } from '../src/perceive.ts'
+import { solveChallenge } from '../src/vision.ts'
 import { serveTestDir } from './test-server.ts'
 
 let pass = 0

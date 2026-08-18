@@ -3,7 +3,7 @@
 import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { FactsStore, extractDomains } from './memory.ts'
+import { FactsStore, extractDomains } from '../src/memory.ts'
 
 let pass = 0
 let fail = 0

@@ -1,6 +1,6 @@
-import { launchChrome, waitForPort, CDP, killChrome, sleep } from './browser.ts'
-import { buildSnapshot } from './perceive.ts'
-import { chat } from './llm.ts'
+import { launchChrome, waitForPort, CDP, killChrome, sleep } from '../src/browser.ts'
+import { buildSnapshot } from '../src/perceive.ts'
+import { chat } from '../src/llm.ts'
 
 const { proc, port } = await launchChrome({})
 try {

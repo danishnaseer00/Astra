@@ -3,8 +3,8 @@
 // same CDP methods the agent's tools call. npm run form-test
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { launchChrome, waitForPort, CDP, killChrome } from './browser.ts'
-import { buildSnapshot } from './perceive.ts'
+import { launchChrome, waitForPort, CDP, killChrome } from '../src/browser.ts'
+import { buildSnapshot } from '../src/perceive.ts'
 import { serveTestDir } from './test-server.ts'
 
 let pass = 0

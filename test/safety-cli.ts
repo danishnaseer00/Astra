@@ -3,9 +3,9 @@
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { launchChrome, waitForPort, CDP, killChrome } from './browser.ts'
-import { gate, inScope, cleanUrl, decodeRedirect, AuditLog, denyAll, allowAll, sanitizeArgs } from './safety.ts'
-import type { GateVerdict } from './safety.ts'
+import { launchChrome, waitForPort, CDP, killChrome } from '../src/browser.ts'
+import { gate, inScope, cleanUrl, decodeRedirect, AuditLog, denyAll, allowAll, sanitizeArgs } from '../src/safety.ts'
+import type { GateVerdict } from '../src/safety.ts'
 
 let pass = 0
 let fail = 0
