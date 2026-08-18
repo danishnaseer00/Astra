@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -201,12 +201,6 @@ export class CDP {
       throw new Error(`evaluate failed: ${what}`)
     }
     return (msg.result?.result as { value?: unknown } | undefined)?.value
-  }
-
-  // A picture of the page — the seed of vision-based perception.
-  async screenshot(outPath: string): Promise<void> {
-    const data = await this.screenshotBase64()
-    writeFileSync(outPath, Buffer.from(data, 'base64'))
   }
 
   // In-memory screenshot: full viewport, or clipped to a region (the captcha
