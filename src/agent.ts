@@ -273,6 +273,23 @@ async function execute(tab: { cdp: CDP }, name: string, args: Record<string, unk
     case 'extract': {
       await sleep(600)
 
+      // Benchmark data lives in tables (arXiv papers, HF model cards), which
+      // sit mid-page — beyond both the head slice and the tail slice. Pull
+      // table contents out directly so they always reach the model.
+      const tables = (await cdp.evaluate(
+        `(() => {
+          const out = []
+          for (const tb of document.querySelectorAll('table')) {
+            if (out.length >= 6) break
+            const ctx = (tb.closest('section, article, figure, div')?.querySelector('h1, h2, h3, h4, caption, figcaption')?.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 100)
+            const rows = [...tb.querySelectorAll('tr')].slice(0, 12).map((tr) => [...tr.querySelectorAll('th, td')].map((c) => c.innerText.trim()).join(' | '))
+            if (!rows.length) continue
+            out.push((ctx ? ctx + ':' : 'Table ' + (out.length + 1)) + '\\n' + rows.join('\\n'))
+          }
+          return out
+        })()`
+      )) as string[]
+
       const facts = (await cdp.evaluate(
         `(() => {
           const rows = [...document.querySelectorAll('article, .product, [class*="product"], .card')]
@@ -301,7 +318,8 @@ async function execute(tab: { cdp: CDP }, name: string, args: Record<string, unk
         })()`
       )) as string)
       const priced = facts.length >= 2 ? 'PRICES ON THIS PAGE:\n' + facts.join('\n') + '\n\n' : ''
-      return (priced + 'PAGE TEXT:\n' + text).slice(0, 8000)
+      const tabled = tables.length ? 'TABLES ON THIS PAGE:\n' + tables.join('\n\n') + '\n\n' : ''
+      return (tabled + priced + 'PAGE TEXT:\n' + text).slice(0, 8000)
     }
     case 'search': {
       const q = String(args.query ?? '').trim()
@@ -735,8 +753,14 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
         verdict: 'executed',
       })
       console.log(`  -> ${tc.name}(${JSON.stringify(tc.args).slice(0, 120)})\n     ${result.slice(0, 200)}`)
-      // Lossy: old page dumps get truncated before they enter history.
-      const slim = result.length > TOOL_RESULT_CAP ? result.slice(0, TOOL_RESULT_CAP) + `\n...[truncated ${result.length - TOOL_RESULT_CAP} chars]` : result
+      // Lossy: old page dumps get truncated before they enter history. Keep
+      // the END of a dump too — head-only truncation hid mid-page benchmark
+      // tables: arXiv/HF pages lead with boilerplate, tables sit below it.
+      const cap = TOOL_RESULT_CAP
+      const slim =
+        result.length > cap
+          ? result.slice(0, Math.floor(cap * 0.75)) + `\n...[truncated ${result.length - cap} chars]...\n` + result.slice(-Math.ceil(cap * 0.25))
+          : result
       push({ role: 'tool', tool_call_id: tc.id, content: slim })
     }
   }

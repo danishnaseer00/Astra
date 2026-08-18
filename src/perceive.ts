@@ -60,7 +60,13 @@ export async function buildSnapshot(cdp: CDP): Promise<Snapshot> {
       return {
         url: location.href,
         title: document.title,
-        bodyText: document.body ? document.body.innerText.slice(0, 2000) : '',
+        // Head+tail splice: pages lead with nav/boilerplate, so a head-only
+        // slice hides the actual content from the snapshot (see extract).
+        bodyText: document.body ? (() => {
+          const t = document.body.innerText
+          if (t.length <= 2000) return t
+          return t.slice(0, 1400) + '\n...[middle ' + (t.length - 2000) + ' chars omitted]...\n' + t.slice(-600)
+        })() : '',
         challengeRect: (() => {
           const f = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], iframe[src*="cf-chl"], iframe[title*="challenge" i]')
           if (!f) return null
