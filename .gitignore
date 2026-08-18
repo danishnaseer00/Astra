@@ -8,3 +8,5 @@ smoke-*.txt
 smoke-*.log
 task.md
 architecture.md
+memory/
+

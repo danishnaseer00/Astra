@@ -85,6 +85,9 @@ export function killChrome(proc: ChildProcess): void {
 }
 
 export interface TargetInfo {
+  id?: string
+  title?: string
+  active?: boolean
   type: string
   url: string
   webSocketDebuggerUrl?: string
@@ -158,8 +161,13 @@ export class CDP {
     const targets = await listTargets(port)
     const target = targets.find((t) => t.type === targetType && !t.url.startsWith('chrome://'))
     if (!target?.webSocketDebuggerUrl) throw new Error(`No ${targetType} target found on port ${port}`)
+    return CDP.connectTo(target.webSocketDebuggerUrl)
+  }
 
-    const ws = new WebSocket(target.webSocketDebuggerUrl)
+  // The tab tools (Phase 7) attach to a specific target's socket by URL —
+  // this is how switch_tab re-points the agent at another page.
+  static async connectTo(wsUrl: string): Promise<CDP> {
+    const ws = new WebSocket(wsUrl)
     const cdp = new CDP(new WebSocketCommand(ws))
 
     await new Promise<void>((resolve, reject) => {
@@ -197,11 +205,21 @@ export class CDP {
 
   // A picture of the page — the seed of vision-based perception.
   async screenshot(outPath: string): Promise<void> {
+    const data = await this.screenshotBase64()
+    writeFileSync(outPath, Buffer.from(data, 'base64'))
+  }
+
+  // In-memory screenshot: full viewport, or clipped to a region (the captcha
+  // solver captures just the challenge iframe so the vision model sees the
+  // puzzle, not the page around it). Returns raw base64 PNG.
+  async screenshotBase64(clip?: { x: number; y: number; width: number; height: number }): Promise<string> {
     await this.send('Page.enable')
-    const msg = await this.send('Page.captureScreenshot', { format: 'png' })
+    const params: Record<string, unknown> = { format: 'png' }
+    if (clip) params.clip = { ...clip, scale: 1 }
+    const msg = await this.send('Page.captureScreenshot', params)
     const data = msg.result?.data as string | undefined
     if (!data) throw new Error('captureScreenshot returned no data')
-    writeFileSync(outPath, Buffer.from(data, 'base64'))
+    return data
   }
 
   // === Phase 1: the actor — real, trusted input events ===
@@ -341,8 +359,34 @@ export class CDP {
   }
 
   // Focus an element and insert text the way a real keyboard would.
+  // Composite inputs (date/color/range/number) ignore Input.insertText —
+  // for those, set the value the way a script would and dispatch real events.
   async type(selector: string, text: string): Promise<boolean> {
     await this.send('Page.bringToFront')
+    const mode = await this.evaluate(
+      `(() => {
+        const el = document.querySelector(${JSON.stringify(selector)})
+        if (!el) return null
+        const t = (el.getAttribute?.('type') || '').toLowerCase()
+        if (t === 'date' || t === 'color' || t === 'range' || t === 'number' || t === 'time' || t === 'datetime-local' || t === 'month' || t === 'week') return 'script'
+        return 'keyboard'
+      })()`
+    )
+    if (mode === null) return false
+    if (mode === 'script') {
+      const ok = await this.evaluate(
+        `(() => {
+          const el = document.querySelector(${JSON.stringify(selector)})
+          if (!el) return false
+          el.focus()
+          el.value = ${JSON.stringify(text)}
+          el.dispatchEvent(new Event('input', { bubbles: true }))
+          el.dispatchEvent(new Event('change', { bubbles: true }))
+          return true
+        })()`
+      )
+      return ok === true
+    }
     const focused = await this.evaluate(
       `(() => {
         const el = document.querySelector(${JSON.stringify(selector)})
@@ -354,6 +398,52 @@ export class CDP {
     if (!focused) return false
     await this.send('Input.insertText', { text })
     return true
+  }
+
+  // Form wizardry: pick option(s) in a <select> — value, not index, so the
+  // model works from what the snapshot shows (option text) or a real value.
+  async selectOption(selector: string, values: string[]): Promise<boolean> {
+    await this.send('Page.bringToFront')
+    const want = JSON.stringify(values)
+    const ok = await this.evaluate(
+      `(() => {
+        const el = document.querySelector(${JSON.stringify(selector)})
+        if (!(el instanceof HTMLSelectElement)) return false
+        const values = ${want}
+        if (el.multiple) {
+          for (const opt of el.options) opt.selected = values.includes(opt.value) || values.includes(opt.text.trim())
+        } else {
+          const opt = [...el.options].find((o) => values.includes(o.value) || values.includes(o.text.trim()))
+          if (!opt) return false
+          el.value = opt.value
+        }
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+        el.dispatchEvent(new Event('change', { bubbles: true }))
+        return true
+      })()`
+    )
+    return ok === true
+  }
+
+  // Form wizardry: attach a local file to an <input type=file>. The browser
+  // won't let JS invent a file path — but the agent OWNS the browser, so it
+  // reads the file on disk and rebuilds it as a File object in the page.
+  async uploadFile(selector: string, file: { name: string; type: string; base64: string }): Promise<boolean> {
+    await this.send('Page.bringToFront')
+    const ok = await this.evaluate(
+      `(async () => {
+        const el = document.querySelector(${JSON.stringify(selector)})
+        if (!(el instanceof HTMLInputElement) || el.type !== 'file') return false
+        const bytes = Uint8Array.from(atob(${JSON.stringify(file.base64)}), (c) => c.charCodeAt(0))
+        const dt = new DataTransfer()
+        dt.items.add(new File([bytes], ${JSON.stringify(file.name)}, { type: ${JSON.stringify(file.type)} }))
+        el.files = dt.files
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+        el.dispatchEvent(new Event('change', { bubbles: true }))
+        return true
+      })()`
+    )
+    return ok === true
   }
 
   // Scroll the page (negative deltaY scrolls up).
@@ -399,4 +489,86 @@ export class CDP {
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
+}
+
+// === Phase 7: tab tools ======================================================
+// The agent used to live in exactly one tab; open_tab/switch_tab/close_tab
+// give it a tab strip. The host abstracts "where tabs live": the CLI drives
+// the debug port's /json/* HTTP API (Chrome's own tab management); the shell
+// could implement a WebContentsView-backed host later.
+
+export interface TabInfo {
+  id: string
+  title: string
+  url: string
+  active: boolean
+}
+
+export interface TabHost {
+  list(): Promise<TabInfo[]>
+  open(url: string): Promise<TabInfo>
+  activate(id: string): Promise<CDP>
+  close(id: string): Promise<TabInfo[]>
+}
+
+export class CliTabHost implements TabHost {
+  private readonly port: number
+  private activeId: string | null = null
+
+  constructor(port: number) {
+    this.port = port
+  }
+
+  private async pageTargets(): Promise<TargetInfo[]> {
+    const targets = await listTargets(this.port)
+    return targets.filter((t) => t.type === 'page' && !t.url.startsWith('chrome://') && !t.url.startsWith('devtools://'))
+  }
+
+  private async infoFor(t: TargetInfo): Promise<TabInfo> {
+    // Chrome reports the real foreground tab; once the agent itself opens or
+    // activates a tab, its choice wins (the driven page may not be foreground).
+    const active = this.activeId !== null ? t.id === this.activeId : !!t.active
+    return { id: t.id ?? '', title: t.title || '(untitled)', url: t.url, active }
+  }
+
+  async list(): Promise<TabInfo[]> {
+    const targets = await this.pageTargets()
+    // Keep the active tab honest even if it closed under us.
+    if (this.activeId && !targets.some((t) => t.id === this.activeId)) this.activeId = null
+    // Chrome does not report the foreground tab in /json/list; adopt the sole
+    // tab as active when we have no tracking state (fresh browser).
+    if (this.activeId === null && targets.length === 1) this.activeId = targets[0].id ?? null
+    return Promise.all(targets.map((t) => this.infoFor(t)))
+  }
+
+  async open(url: string): Promise<TabInfo> {
+    // Chrome's own "new tab" endpoint: PUT /json/new?<url> returns the target.
+    const res = await fetch(`http://127.0.0.1:${this.port}/json/new?${encodeURIComponent(url)}`, { method: 'PUT' })
+    if (!res.ok) throw new Error(`failed to open tab (${res.status})`)
+    const t = (await res.json()) as TargetInfo
+    this.activeId = t.id ?? null
+    return this.infoFor(t)
+  }
+
+  // Re-point the agent at another tab. Returns the fresh CDP connection.
+  async activate(id: string): Promise<CDP> {
+    const target = (await this.pageTargets()).find((t) => t.id === id)
+    if (!target?.webSocketDebuggerUrl) throw new Error(`tab ${id} not found`)
+    this.activeId = id
+    return CDP.connectTo(target.webSocketDebuggerUrl)
+  }
+
+  async close(id: string): Promise<TabInfo[]> {
+    await fetch(`http://127.0.0.1:${this.port}/json/close/${id}`).catch(() => {})
+    const rest = await this.list()
+    if (this.activeId === id) {
+      this.activeId = null
+      if (rest.length === 0) {
+        // Closed the last tab — the agent must have a page to act on.
+        await this.open('about:blank')
+        return this.list()
+      }
+    }
+    return this.list()
+  }
 }

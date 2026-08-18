@@ -149,8 +149,12 @@ export function promptPolicy(opts: { timeoutMs?: number } = {}): Policy {
 // refuse batched mutating calls, and the gate gates exactly these. Keep the
 // tool list in one place so a new tool can't be forgotten in one of the two
 // copies (a real past bug: search navigates, but wasn't gated).
-export const MUTATING = new Set(['navigate', 'click', 'type'])
-const GATEABLE = MUTATING
+// Phase 7 additions: tab tools change which page is active (snapshot stale →
+// mutating), and the form wizardry tools change the page.
+export const MUTATING = new Set(['navigate', 'click', 'type', 'open_tab', 'switch_tab', 'close_tab', 'select_option', 'upload_file'])
+// open_tab carries a destination URL like navigate; upload_file transmits a
+// local file to a site. Everything else on the element rails.
+const GATEABLE = new Set(['navigate', 'click', 'type', 'open_tab', 'upload_file', 'select_option'])
 
 // Inspect the target element for click/type gates — code reads the DOM, the
 // LLM never writes the summary. Deny on uncertainty: if the page won't tell
@@ -191,20 +195,33 @@ export async function gate(
   let why: string[] = []
   let domain: string | undefined
 
-  if (tool === 'navigate') {
+  if (tool === 'navigate' || tool === 'open_tab') {
     const url = cleanUrl(String(args.url ?? ''))
     domain = urlDomain(url)
     // Rail 2: refuse non-web schemes outright — deny on uncertainty.
     if (!isWebUrl(url)) {
       why = ['non-web scheme']
-      summary = `Navigate to ${url}\nDENIED: only http(s) destinations are allowed`
+      summary = `${tool === 'open_tab' ? 'Open tab' : 'Navigate to'} ${url}\nDENIED: only http(s) destinations are allowed`
     } else if (allowedDomains.length > 0 && !inScope(url, allowedDomains)) {
       why = ['outside scoped domains']
-      summary = `Navigate to ${url}\nSCOPING: allowed domains are ${allowedDomains.join(', ')}`
+      summary = `${tool === 'open_tab' ? 'Open tab' : 'Navigate to'} ${url}\nSCOPING: allowed domains are ${allowedDomains.join(', ')}`
     } else {
       why = matchesBlocklist(url, DESTINATION_RAILS)
-      summary = `Navigate to ${url}`
+      summary = `${tool === 'open_tab' ? 'Open tab' : 'Navigate to'} ${url}`
     }
+  } else if (tool === 'upload_file') {
+    // Attaching a local file to a page transmits data to the site — always a
+    // gate, regardless of the element's text. Summary names the file, never
+    // its contents.
+    const sel = `[data-agent-i="${String(args.index)}"]`
+    const el = await inspectElement(cdp, sel)
+    if (!el) {
+      return { allowed: false, gated: true, summary: `upload_file element ${String(args.index)}`, reason: 'element unreadable — denied on uncertainty', why: ['unreadable'] }
+    }
+    const fileArg = (args.file ?? {}) as { name?: string; path?: string }
+    const name = String(fileArg.name ?? String(fileArg.path ?? '').split(/[\\/]/).pop() ?? '?').slice(0, 80)
+    summary = `Upload local file "${name}" to ${el.summary}`
+    why = ['local file upload']
   } else {
     const sel = `[data-agent-i="${String(args.index)}"]`
     const el = await inspectElement(cdp, sel)
@@ -255,6 +272,12 @@ export function sanitizeArgs(args: Record<string, unknown>): Record<string, unkn
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(args)) {
     if (k === 'text') out[k] = '[redacted]'
+    // upload_file carries a local path — the audit keeps the file NAME only,
+    // never the path (a path can leak the username or machine layout).
+    else if (k === 'file' && typeof v === 'object' && v !== null) {
+      const path = String((v as { path?: string }).path ?? '')
+      out[k] = { name: path.split(/[\\/]/).pop() || '?' }
+    }
     else out[k] = typeof v === 'string' ? scrubPii(v) : v
   }
   return out

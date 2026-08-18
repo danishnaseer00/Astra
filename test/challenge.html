@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>challenge test</title>
+</head>
+<body>
+<h1>Verify you are human</h1>
+<p>This page hosts a challenge iframe (mimics a Turnstile/reCAPTCHA widget).</p>
+<iframe title="challenge" src="puzzle-frame.html" width="420" height="430" style="border:1px solid #ccc"></iframe>
+<p id="result">waiting for the puzzle frame…</p>
+<script>
+window.addEventListener('message', (e) => {
+  if (e.data === 'CLEARED') document.getElementById('result').textContent = 'CHALLENGE CLEARED'
+})
+</script>
+</body>
+</html>

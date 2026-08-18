@@ -1,13 +1,18 @@
 import type { CDP } from './browser.ts'
 import { sleep } from './browser.ts'
+import type { TabHost } from './browser.ts'
+import { readFileSync } from 'node:fs'
 import { buildSnapshot, type Snapshot } from './perceive.ts'
 import { scrubPii } from './perceive.ts'
 import { chatWithTools, type ChatMessage, type ChatWithToolsResult, type ToolSchema } from './llm.ts'
 import { gate, cleanUrl, denyAll, sanitizeArgs, MUTATING, type AuditLog, type Policy } from './safety.ts'
+import { describePage, solveChallenge } from './vision.ts'
+import { FactsStore, extractDomains } from './memory.ts'
 
 const BUDGET = 24
 
-// The six-tool vocabulary from lesson 5. Few and stable.
+// The tool vocabulary from lesson 5, grown through the phases: six core
+// tools, search (6), then vision + tabs + form wizardry (7). Few and stable.
 const TOOLS: ToolSchema[] = [
   {
     type: 'function',
@@ -71,6 +76,72 @@ const TOOLS: ToolSchema[] = [
   {
     type: 'function',
     function: {
+      name: 'observe',
+      description:
+        'Describe what the page LOOKS like (vision): layout, images, canvas content, overlays, dialogs, anything visible but not in the DOM text. Use when the DOM snapshot seems empty, when visuals matter (images, charts), or to check what is on screen.',
+      parameters: { type: 'object', properties: { question: { type: 'string' } }, required: ['question'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'open_tab',
+      description:
+        'Open a URL in a NEW tab and switch to it. Use for parallel research — each open_tab result tells you the new tab index. Same URL rules as navigate.',
+      parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'switch_tab',
+      description: 'Switch to another open tab by index (from list_tabs). The snapshot then reflects that tab.',
+      parameters: { type: 'object', properties: { index: { type: 'integer', minimum: 0 } }, required: ['index'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'close_tab',
+      description: 'Close the tab at this index (from list_tabs). The active tab cannot be closed by itself — closing it switches to another tab.',
+      parameters: { type: 'object', properties: { index: { type: 'integer', minimum: 0 } }, required: ['index'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_tabs',
+      description: 'List all open tabs (index, title, URL, active). Call before switch_tab or close_tab to learn the current indices.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'select_option',
+      description: 'Choose an option in a <select> dropdown by this snapshot index. Provide the option value, or its visible text if no value is known.',
+      parameters: {
+        type: 'object',
+        properties: { index: { type: 'integer', minimum: 0 }, value: { type: 'string' } },
+        required: ['index', 'value'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'upload_file',
+      description: 'Attach a local file to a file-upload input (this snapshot index). The file must exist on this machine; the path is read from disk. Gated: uploading transmits the file to the site.',
+      parameters: {
+        type: 'object',
+        properties: { index: { type: 'integer', minimum: 0 }, file: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
+        required: ['index', 'file'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'done',
       description: 'End the task with the final answer. Use when the goal is met — or when you are stuck and cannot proceed.',
       parameters: { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] },
@@ -95,23 +166,69 @@ const SYSTEM =
   'Use the search tool to find pages when the goal does not name a URL — never invent URLs from memory; open the most promising search result. ' +
   'If the goal names a URL, navigate to it directly — never search for a URL you already have. ' +
   'Only report what you actually observed: never claim a failed navigation, a recovery, or a page visit you did not perform. ' +
-  'You may emit MULTIPLE tool calls in one reply ONLY when they are read-only and independent (search, extract, scroll). ' +
-  'navigate, click, and type change the page: at most ONE of those per reply — afterwards wait for the refreshed snapshot before acting again. ' +
+  'You may emit MULTIPLE tool calls in one reply ONLY when they are read-only and independent (search, extract, scroll, observe, list_tabs). ' +
+  'navigate, click, type, open_tab, switch_tab, close_tab, select_option, and upload_file change the page or active tab: at most ONE of those per reply — afterwards wait for the refreshed snapshot before acting again. ' +
   'Scroll changes the layout but not the page: after a scroll in the same reply, snapshot indexes are stale — never click or type after scrolling; wait for the next snapshot. ' +
+  'Tabs: open_tab returns the new tab\'s index; switch_tab/close_tab need list_tabs first. The snapshot always reflects the ACTIVE tab only. ' +
   'If you are warned that you are looping, stop repeating the same navigation/search/extract and answer from the facts you already have.'
 
 const selFor = (i: unknown) => `[data-agent-i="${String(i)}"]`
 
-// Execute one tool call against the browser; returns what the model gets back.
-// A tool that throws must fail loudly as a tool result — never crash the loop.
-async function execute(cdp: CDP, name: string, args: Record<string, unknown>, opts?: AgentOptions): Promise<string> {
+async function execute(tab: { cdp: CDP }, name: string, args: Record<string, unknown>, opts?: AgentOptions): Promise<string> {
+  const cdp = tab.cdp
   try {
     switch (name) {
     case 'navigate': {
-      // Models sometimes wrap or fat-finger URLs — clean before navigating.
+
       const url = cleanUrl(String(args.url ?? ''))
       await cdp.navigate(url)
       return `Navigated. Current URL: ${(await cdp.evaluate('location.href')) as string}`
+    }
+    case 'open_tab': {
+      const host = opts?.tabs
+      if (!host) return 'FAILED: tab tools are not available in this mode'
+      const url = cleanUrl(String(args.url ?? ''))
+      const info = await host.open(url)
+      tab.cdp = await host.activate(info.id)
+      await tab.cdp.waitForLoad(url)
+      const tabs = await host.list()
+      return `Opened new tab [${tabs.findIndex((t) => t.id === info.id)}]: ${info.url} — now active.`
+    }
+    case 'switch_tab': {
+      const host = opts?.tabs
+      if (!host) return 'FAILED: tab tools are not available in this mode'
+      const tabs = await host.list()
+      const i = Number(args.index)
+      if (!Number.isInteger(i) || i < 0 || i >= tabs.length) return `FAILED: tab index ${i} out of range (${tabs.length} tabs open)`
+      const t = tabs[i]
+      if (t.active) return `Already on tab ${i} (${t.url})`
+      tab.cdp = await host.activate(t.id)
+      await tab.cdp.waitForLoad()
+      return `Switched to tab ${i}: ${t.url} (title: ${t.title})`
+    }
+    case 'close_tab': {
+      const host = opts?.tabs
+      if (!host) return 'FAILED: tab tools are not available in this mode'
+      const tabs = await host.list()
+      const i = Number(args.index)
+      if (!Number.isInteger(i) || i < 0 || i >= tabs.length) return `FAILED: tab index ${i} out of range (${tabs.length} tabs open)`
+      const closing = tabs[i]
+      const rest = await host.close(closing.id)
+      // Closing the active tab re-points the agent at the replacement tab.
+      const active = rest.find((t) => t.active) ?? rest[0]
+      if (active) {
+        tab.cdp = await host.activate(active.id)
+        await tab.cdp.waitForLoad()
+      }
+      return `Closed tab ${i} (${closing.url}). ${rest.length} tabs remain.`
+    }
+    case 'list_tabs': {
+      const host = opts?.tabs
+      if (!host) return 'FAILED: tab tools are not available in this mode'
+      const tabs = await host.list()
+      if (tabs.length === 0) return 'No tabs open.'
+      return 'OPEN TABS (index — title — URL [active]):\n' +
+        tabs.map((t, i) => `${i} — ${t.title} — ${t.url}${t.active ? ' [ACTIVE]' : ''}`).join('\n')
     }
     case 'click': {
       const ok = await cdp.click(selFor(args.index))
@@ -123,19 +240,39 @@ async function execute(cdp: CDP, name: string, args: Record<string, unknown>, op
       const ok = await cdp.type(selFor(args.index), String(args.text ?? ''))
       return ok ? 'Typed.' : 'FAILED: index not found or not visible in the current snapshot'
     }
+    case 'select_option': {
+      const raw = Array.isArray(args.values) ? args.values : [String(args.value ?? '')]
+      const values = raw.map((v) => String(v).trim()).filter(Boolean)
+      if (values.length === 0) return 'FAILED: select_option needs a value'
+      const ok = await cdp.selectOption(selFor(args.index), values)
+      return ok ? `Selected option "${values.join(', ')}".` : 'FAILED: index is not a <select>, or the value does not match any option'
+    }
+    case 'upload_file': {
+      const fileArg = (args.file ?? {}) as { path?: string }
+      const path = String(fileArg.path ?? '')
+      if (!path) return 'FAILED: upload_file needs file.path'
+      let data: Buffer
+      try {
+        data = readFileSync(path)
+      } catch {
+        return `FAILED: cannot read local file "${path}"`
+      }
+      const name = path.split(/[\\/]/).pop() || 'file'
+      const ok = await cdp.uploadFile(selFor(args.index), { name, type: 'application/octet-stream', base64: data.toString('base64') })
+      return ok ? `Uploaded "${name}" (${data.length} bytes).` : 'FAILED: index is not a file input'
+    }
+    case 'observe': {
+      // Vision grounding: the DOM snapshot is blind to pixels. One screenshot,
+      // one description — cheap enough to use when the DOM lies or hides.
+      return 'VISUAL DESCRIPTION:\n' + (await describePage(cdp))
+    }
     case 'scroll': {
       await cdp.scroll(args.direction === 'up' ? -600 : 600)
       return 'Scrolled.'
     }
     case 'extract': {
-      // SPA hydration settle: readyState "complete" + fonts can be true while
-      // React/Vue content is still mounting. One short beat makes the read
-      // land on rendered content, not an empty shell (prices on claude.com,
-      // chatgpt.com, etc.).
       await sleep(600)
-      // Structured facts first (pair prices with their product titles), then raw text.
-      // The facts pass is for catalog pages only: require 2+ distinct priced rows,
-      // or a stray "$5" in some unrelated element becomes a fake "PRICES" section.
+
       const facts = (await cdp.evaluate(
         `(() => {
           const rows = [...document.querySelectorAll('article, .product, [class*="product"], .card')]
@@ -153,11 +290,7 @@ async function execute(cdp: CDP, name: string, args: Record<string, unknown>, op
           return [...new Set(rows)].slice(0, 40)
         })()`
       )) as string[]
-      // Nav bars and hero sections sit at the TOP of body.innerText — on long
-      // pages a top-only slice reads as "header junk" and the model re-extracts
-      // forever. Prefer <main> (the content region) and, when the page is long,
-      // keep the head AND the tail so mid/lower-page content (prices, plans)
-      // actually reaches the model.
+
       const text = scrubPii((await cdp.evaluate(
         `(() => {
           const main = document.querySelector('main')
@@ -173,9 +306,7 @@ async function execute(cdp: CDP, name: string, args: Record<string, unknown>, op
     case 'search': {
       const q = String(args.query ?? '').trim()
       if (!q) return 'FAILED: search requires a non-empty query'
-      // The search tool loads an engine index page (a read-only "plugin"), then
-      // stops: result pages are only reached through the gated navigate tool,
-      // so domain scoping still decides where the agent may actually act.
+
       const tryEngine = async (url: string): Promise<string[]> => {
         await cdp.navigate(url)
         return (await cdp.evaluate(
@@ -268,6 +399,11 @@ export interface AgentOptions {
   // Phase 7: the shell mirrors search engine pages into background tabs so the
   // user can watch where the agent is looking (Comet-style tab-per-search).
   onTabOpen?: (url: string, label?: string) => void
+  // Phase 7: tab tools — the host that creates/switches/closes tabs. Absent
+  // (shell single-view) → tab tools report FAILED.
+  tabs?: TabHost
+  // Phase 7: persistent memory — facts survive runs via the domain-keyed store.
+  memory?: FactsStore
 }
 
 // The whole agent: perceive → decide → execute, with a hard step budget.
@@ -280,14 +416,18 @@ const estimateTokens = (s: string) => Math.round(s.length / 4)
 
 export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}): Promise<AgentRun> {
   // Safety defaults: deny by default, no scope limit, no audit, 5-minute cap.
-  const { policy = denyAll, allowedDomains = [], audit, timeBudgetMs = 5 * 60_000, isCancelled, context } = opts
+  const { policy = denyAll, allowedDomains = [], audit, timeBudgetMs = 5 * 60_000, isCancelled, context, tabs, memory } = opts
   const startedAt = Date.now()
+  // Tab tools re-point this holder at other pages; everything else reads
+  // `tab.cdp`, so switching tabs mid-run just works.
+  const tab: { cdp: CDP } = { cdp }
   // History holds assistant turns, tool results, nudges — NOT snapshots.
   const history: ChatMessage[] = []
   let totalTokens = 0
   let gated = 0
   let denied = 0
   let challengeClicks = 0
+  let challengeVisionTried = false
 
   const push = (msg: ChatMessage) => {
     history.push(msg)
@@ -335,10 +475,22 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
   const gatheredTail = (): string =>
     gathered.length ? '\n\nFACTS GATHERED SO FAR:\n- ' + gathered.join('\n- ') : ''
 
+  // Persistent memory: every exit path goes through finish() so the run's
+  // residue (goal, facts, answer) is stored per-domain before returning.
+  const memoryDomains = new Set<string>()
+  for (const d of allowedDomains) memoryDomains.add(d)
+  for (const d of extractDomains(goal + (context ?? ''))) memoryDomains.add(d)
+  const finish = (answer: string, steps: number): AgentRun => {
+    if (memory) for (const d of memoryDomains) memory.remember(d, goal, gathered, answer)
+    return { answer, steps, totalTokens, gated, denied }
+  }
+  const memoryContext = memory?.recallForDomains([...memoryDomains]) ?? ''
+  const contextBlock = [context, memoryContext].filter(Boolean).join('\n')
+
   for (let step = 1; step <= BUDGET; step++) {
-    if (isCancelled?.()) return { answer: '[cancelled] task stopped by the user' + gatheredTail(), steps: step, totalTokens, gated, denied }
+    if (isCancelled?.()) return finish('[cancelled] task stopped by the user' + gatheredTail(), step)
     if (Date.now() - startedAt > timeBudgetMs) {
-      return { answer: '[time budget exhausted] task incomplete' + gatheredTail(), steps: step, totalTokens, gated, denied }
+      return finish('[time budget exhausted] task incomplete' + gatheredTail(), step)
     }
     // Budget-pressure nudge: exploration tasks (T6, T14) used to burn all 24
     // steps wandering or re-scanning, then exhaust without an answer. Once the
@@ -354,23 +506,35 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     }
     let snapshot: Snapshot
     try {
-      snapshot = await buildSnapshot(cdp)
+      snapshot = await buildSnapshot(tab.cdp)
     } catch (err) {
       const why = err instanceof Error ? err.message : String(err)
-      return { answer: `[agent stuck: could not perceive the page — ${why}]` + gatheredTail(), steps: step, totalTokens, gated, denied }
+      return finish(`[agent stuck: could not perceive the page — ${why}]` + gatheredTail(), step)
     }
-    // Bounded challenge auto-click: tick the Turnstile checkbox by dispatching
-    // a TRUSTED click at the iframe's center (cross-origin blocks JS, not
-    // input events). If it doesn't clear in two tries, stop and let the model
-    // route around — never burn the budget on a bot wall.
-    if (snapshot.challengeRect && challengeClicks < 2) {
+    // Challenge handling, Phase 7: one checkbox tick (cheap, clears most
+    // Turnstile walls), then the VISION solver (reads the puzzle out of a
+    // clipped screenshot and clicks the answers). If both fail, the snapshot
+    // warning tells the model to route around — never burn the budget.
+    if (snapshot.challengeRect && challengeClicks < 1) {
       challengeClicks++
       const { x, y } = snapshot.challengeRect
-      console.log(`  !! auto-clicking challenge checkbox at ${x},${y} (try ${challengeClicks}/2)`)
-      await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 }).catch(() => {})
-      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 }).catch(() => {})
+      console.log(`  !! auto-clicking challenge checkbox at ${x},${y}`)
+      await tab.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 }).catch(() => {})
+      await tab.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 }).catch(() => {})
       await sleep(2500)
       continue
+    }
+    if (snapshot.challengeRect && !challengeVisionTried) {
+      challengeVisionTried = true
+      const rect = snapshot.challengeRect
+      console.log(`  !! challenge persists — vision solver on ${rect.width}x${rect.height} iframe`)
+      const result = await solveChallenge(tab.cdp, rect).catch((err) => ({ solved: false, rounds: -1, err: err instanceof Error ? err.message : String(err) }))
+      if (result.solved || result.rounds === 0) {
+        console.log('  !! challenge cleared')
+        continue // fresh snapshot next step — the model sees a normal page
+      }
+      console.log(`  !! challenge not cleared (${result.rounds} rounds) — model will route around`)
+      // fall through: the snapshot's ⚠ warning tells the model to move on
     }
     // The snapshot system message carries any pending loop nudge. buildContext
     // is PURE (takes the nudge as an argument) because it is called for token
@@ -380,7 +544,7 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
       { role: 'system', content: SYSTEM },
       {
         role: 'user',
-        content: `GOAL: ${goal}${context ? `\n\nCONTEXT FROM PREVIOUS TURNS:\n${context}` : ''}`,
+        content: `GOAL: ${goal}${contextBlock ? `\n\nCONTEXT FROM PREVIOUS TURNS:\n${contextBlock}` : ''}`,
       },
       ...history,
       { role: 'system', content: `CURRENT SNAPSHOT (fresh):\n${snapshot.render}${nudge}` },
@@ -448,7 +612,7 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     } catch (err) {
       const why = err instanceof Error ? err.message : String(err)
       console.log(`  !! LLM API failed — ${why}`)
-      return { answer: `[agent stuck: the model API failed (${why}). Wait a moment, then run again.]` + gatheredTail(), steps: step, totalTokens, gated, denied }
+      return finish(`[agent stuck: the model API failed (${why}). Wait a moment, then run again.]` + gatheredTail(), step)
     }
     if (decision.toolCalls.length === 0) {
       const raw = decision.content.trim()
@@ -457,7 +621,7 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
       const junk = !raw || raw.includes('</') || raw.includes('```') || /^\s*\{?\s*"name"\s*:\s*"/.test(raw) || raw.length > 500
       const answer = junk ? '[agent stuck: the model stopped replying with tool calls]' + gatheredTail() : raw
       console.log('  (stopping on plain-text reply)')
-      return { answer, steps: step, totalTokens, gated, denied }
+      return finish(answer, step)
     }
 
     // The assistant's turn is part of history — including its tool calls.
@@ -491,7 +655,7 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
           continue
         }
         console.log(`  -> done(${answer.slice(0, 200)})`)
-        return { answer, steps: step, totalTokens, gated, denied }
+        return finish(answer, step)
       }
 
       // Batched mutating calls after the first one operate on a stale page.
@@ -514,8 +678,8 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
       // Phase 4: every action crosses the gate first. A denied action goes
       // back to the model as a refusal — never executed, never retried.
       console.log(`[agent:gate] ${tc.name}(${JSON.stringify(tc.args).slice(0, 80)})`)
-      const verdict = await gate(cdp, tc.name, tc.args, allowedDomains, policy)
-      const atUrl = audit ? ((await cdp.evaluate('location.href').catch(() => '')) as string) : ''
+      const verdict = await gate(tab.cdp, tc.name, tc.args, allowedDomains, policy)
+      const atUrl = audit ? ((await tab.cdp.evaluate('location.href').catch(() => '')) as string) : ''
       console.log(`[agent:gate] verdict=${verdict.allowed ? 'allowed' : 'denied'} gated=${verdict.gated}`)
       if (verdict.gated) {
         gated++
@@ -542,7 +706,7 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
         if (!verdict.allowed) continue
       }
 
-      const result = await execute(cdp, tc.name, tc.args, opts)
+      const result = await execute(tab, tc.name, tc.args, opts)
       if (tc.name === 'navigate') bumpAction('nav', cleanUrl(String(tc.args.url ?? '')))
       if (tc.name === 'search') bumpAction('search', String(tc.args.query ?? '').trim().toLowerCase())
       if (tc.name === 'scroll') scrolled = true
@@ -577,5 +741,5 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     }
   }
 
-  return { answer: '[budget exhausted] task incomplete' + gatheredTail(), steps: BUDGET, totalTokens, gated, denied }
+  return finish('[budget exhausted] task incomplete' + gatheredTail(), BUDGET)
 }

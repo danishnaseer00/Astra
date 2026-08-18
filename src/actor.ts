@@ -1,6 +1,5 @@
 import { launchChrome, waitForPort, CDP, killChrome, sleep } from './browser.ts'
 
-// The executor must surface failures, never swallow them silently.
 function must(ok: boolean, what: string): asserts ok {
   if (!ok) throw new Error(`action failed: ${what} (element not found or not visible)`)
 }
@@ -10,8 +9,6 @@ try {
   await waitForPort(port)
   const cdp = await CDP.connect(port)
 
-  // httpbingo.org is the maintained fork of httpbin (which frequently 503s);
-  // same form structure: custname/custtel/custemail fields + bare submit button.
   await cdp.navigate('https://httpbingo.org/forms/post')
   console.log('Opened the demo form. Filling it with trusted events...')
 
@@ -22,11 +19,9 @@ try {
   await cdp.screenshot('actor-before.png')
   console.log('Form filled, screenshot saved. Submitting...')
 
-  // httpbin's submit control is a bare <button> — no type attribute.
   must(await cdp.click('button'), 'submit')
   console.log('Clicked submit.')
 
-  // The form POSTs to /post — wait for the navigation to land.
   for (let i = 0; i < 30; i++) {
     const href = (await cdp.evaluate('location.href')) as string
     if (href.includes('/post')) break

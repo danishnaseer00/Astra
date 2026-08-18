@@ -6,6 +6,8 @@ export interface RunConfig {
   domains: string[]
   maxMs: number
   carry: boolean
+  // Phase 7: persist learned facts across runs (memory/facts.json).
+  memory: boolean
 }
 
 export interface TabInfo {

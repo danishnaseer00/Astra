@@ -10,6 +10,10 @@ export interface SnapshotElement {
   type: string
   text: string
   href: string
+  // Form wizardry: the field's name attribute and multi-select flag — a form
+  // field is identified by its name/label, not just its position.
+  name: string
+  multiple: boolean
 }
 
 export interface Snapshot {
@@ -17,11 +21,11 @@ export interface Snapshot {
   title: string
   elements: SnapshotElement[]
   render: string
-  // Center of the Turnstile/captcha iframe, if one is visible. Cross-origin
-  // frames are unreadable from the main frame, but TRUSTED INPUT EVENTS at
-  // these coordinates land inside the widget — that's how we click the
-  // "verify you are human" checkbox.
-  challengeRect: { x: number; y: number } | null
+  // Bounding box of the Turnstile/captcha iframe, if one is visible.
+  // Cross-origin frames are unreadable from the main frame, but TRUSTED INPUT
+  // EVENTS at these coordinates land inside the widget — the checkbox tick
+  // clicks the center, and the vision solver clips this rect to read puzzles.
+  challengeRect: { x: number; y: number; width: number; height: number } | null
 }
 
 // Sensitive data must never reach the model: replace, don't strip.
@@ -62,7 +66,7 @@ export async function buildSnapshot(cdp: CDP): Promise<Snapshot> {
           if (!f) return null
           const r = f.getBoundingClientRect()
           if (r.width < 20 || r.height < 20) return null
-          return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+          return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) }
         })(),
         elements: els.map((el, i) => {
           // The index→selector bridge: the executor looks elements up by this attribute.
@@ -70,11 +74,19 @@ export async function buildSnapshot(cdp: CDP): Promise<Snapshot> {
           const text = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '')
             .trim().replace(/\\s+/g, ' ').slice(0, 100)
           const href = el.tagName === 'A' ? el.getAttribute('href') || '' : ''
-          return { i, tag: el.tagName.toLowerCase(), type: el.getAttribute('type') || '', text, href: href.slice(0, 200) }
+          return {
+            i,
+            tag: el.tagName.toLowerCase(),
+            type: el.getAttribute('type') || '',
+            text,
+            href: href.slice(0, 200),
+            name: el.getAttribute('name') || '',
+            multiple: el instanceof HTMLSelectElement ? el.multiple : false,
+          }
         })
       }
     })()`
-  )) as { url: string; title: string; bodyText: string; challengeRect: { x: number; y: number } | null; elements: SnapshotElement[] }
+  )) as { url: string; title: string; bodyText: string; challengeRect: { x: number; y: number; width: number; height: number } | null; elements: SnapshotElement[] }
 
   const elements = raw.elements.map((el) => ({ ...el, text: scrubPii(el.text), href: scrubPii(el.href) }))
   // URL and title can carry PII (emails, tokens, query strings) — scrub them
@@ -113,9 +125,11 @@ export function detectChallenge(title: string, text: string): boolean {
 export function renderSnapshot(url: string, title: string, elements: SnapshotElement[]): string {
   const lines = elements.map((el) => {
     const kind = el.type ? `${el.tag}[${el.type}]` : el.tag
+    const multi = el.multiple ? '[multiple]' : ''
+    const named = el.name ? ` name=${el.name}` : ''
     const where = el.href ? ` -> ${el.href}` : ''
     const label = el.text ? ` "${el.text}"` : ''
-    return `[${el.i}] <${kind}>${label}${where}`
+    return `[${el.i}] <${kind}${multi}${named}>${label}${where}`
   })
   return `URL: ${url}\nTITLE: ${title}\n${lines.join('\n')}\n`
 }

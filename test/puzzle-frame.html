@@ -1,0 +1,62 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>puzzle</title>
+<style>
+body { font-family: sans-serif; margin: 12px; }
+.tiles { display: grid; grid-template-columns: repeat(3, 100px); gap: 10px; margin-top: 10px; }
+.tile { width: 100px; height: 100px; border: 2px solid #333; cursor: pointer; box-sizing: border-box; }
+.tile.correct { border-color: #2e7d32; outline: 4px solid #2e7d32; }
+#status { font-weight: bold; }
+#status.ok { color: #2e7d32; }
+#status.bad { color: #c62828; }
+</style>
+</head>
+<body>
+<div id="inst">Select all the <b>red</b> squares</div>
+<div class="tiles" id="tiles">
+  <div class="tile" style="background:#e53935" data-target="1"></div>
+  <div class="tile" style="background:#1e88e5" data-target="0"></div>
+  <div class="tile" style="background:#e53935" data-target="1"></div>
+  <div class="tile" style="background:#43a047" data-target="0"></div>
+  <div class="tile" style="background:#fdd835" data-target="0"></div>
+  <div class="tile" style="background:#e53935" data-target="1"></div>
+  <div class="tile" style="background:#8e24aa" data-target="0"></div>
+  <div class="tile" style="background:#1e88e5" data-target="0"></div>
+  <div class="tile" style="background:#e53935" data-target="1"></div>
+</div>
+<p id="status">Waiting for clicks…</p>
+<script>
+// Mimics a real visual challenge: click the red squares. Clicking a wrong
+// (non-red) square resets the progress — like reCAPTCHA's penalty.
+const tiles = [...document.querySelectorAll('.tile')]
+const total = tiles.filter((t) => t.dataset.target === '1').length
+let selected = 0
+const status = document.getElementById('status')
+tiles.forEach((t) => {
+  t.addEventListener('click', () => {
+    if (t.classList.contains('correct')) return
+    if (t.dataset.target === '1') {
+      t.classList.add('correct')
+      selected++
+      status.textContent = `${selected}/${total} selected`
+      status.className = ''
+    } else {
+      // wrong pick: reset like a real captcha
+      tiles.forEach((x) => { x.classList.remove('correct'); x.style.outline = '2px dashed #c62828' })
+      selected = 0
+      status.textContent = 'Wrong pick — selection reset'
+      status.className = 'bad'
+    }
+    if (selected >= total) {
+      status.textContent = 'Verified — challenge cleared'
+      status.className = 'ok'
+      document.title = 'CLEARED'
+      parent.postMessage('CLEARED', '*')
+    }
+  })
+})
+</script>
+</body>
+</html>

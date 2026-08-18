@@ -10,6 +10,11 @@
     "agent": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/agent-cli.ts",
     "agent-ask": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/agent-cli.ts --ask",
     "safety": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/safety-cli.ts",
+    "vision-test": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/vision-cli.ts",
+    "tab-test": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/tab-cli.ts",
+    "form-test": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/form-cli.ts",
+    "memory-test": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning src/memory-cli.ts",
+    "e2e": "node --env-file-if-exists=.env --experimental-strip-types --disable-warning=ExperimentalWarning e2e/harness.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build:shell": "node scripts/build-shell.mjs",
     "shell": "npm run build:shell && electron ."

@@ -1,7 +1,11 @@
 
+export type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
-  content: string | null
+  content: string | ContentPart[] | null
   tool_call_id?: string
   tool_calls?: ToolCallWire[]
 }
@@ -129,4 +133,24 @@ export async function chatWithTools(messages: ChatMessage[], tools: ToolSchema[]
     return { id: tc.id, name: tc.function.name, args, extra_content: tc.extra_content }
   })
   return { content: msg?.content ?? '', toolCalls }
+}
+
+// Vision round (no tools): ask the model about a screenshot. The OpenAI-compat
+// endpoints (including Gemini's) accept images as data-URL parts.
+export async function chatVision(messages: { role: 'user' | 'system'; content: ContentPart[] }[]): Promise<string> {
+  const json = await callOpenAI({ model: MODEL, messages, temperature: 0.2 })
+  return json.choices?.[0]?.message?.content ?? ''
+}
+
+// One-shot image question — the vision tools' workhorse.
+export async function describeImage(base64Png: string, prompt: string): Promise<string> {
+  return chatVision([
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: prompt },
+        { type: 'image_url', image_url: { url: `data:image/png;base64,${base64Png}` } },
+      ],
+    },
+  ])
 }

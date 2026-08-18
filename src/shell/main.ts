@@ -11,6 +11,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { CDP } from '../browser.ts'
 import { AuditLog, allowAll, denyAll, type Policy, type SensitiveAction } from '../safety.ts'
+import { FactsStore } from '../memory.ts'
 import { DebuggerCommand } from './electron-transport.ts'
 import type { RunConfig, TabInfo } from './ipc-types.ts'
 
@@ -263,6 +264,7 @@ async function createWindow(): Promise<void> {
         domains: [],
         maxMs: 600_000,
         carry: false,
+        memory: false,
       })
     })
   }
@@ -301,6 +303,8 @@ async function startRun(cfg: RunConfig): Promise<{ ok: boolean; error?: string }
     console.log(`GOAL: ${cfg.goal}`)
     if (domains.length) console.log(`SCOPE: ${domains.join(', ')} (navigation outside is denied)`)
     console.log(`POLICY: ${cfg.mode === 'ask' ? 'ask (approval cards)' : cfg.mode === 'allow' ? 'allow-all' : 'deny-all (safe default)'}\n`)
+    // Phase 7: persistent facts across runs, keyed by domain.
+    const memory = cfg.memory ? new FactsStore(join(__dirname, '..', 'memory', 'facts.json')) : undefined
     const run = await runAgent(agentCdp, cfg.goal, {
       policy,
       allowedDomains: domains,
@@ -308,6 +312,7 @@ async function startRun(cfg: RunConfig): Promise<{ ok: boolean; error?: string }
       timeBudgetMs: cfg.maxMs || 5 * 60_000,
       isCancelled: () => cancelled,
       context: cfg.carry && lastTurn ? `goal: ${lastTurn.goal}\nanswer: ${lastTurn.answer}` : undefined,
+      memory,
       // Search mirrors the engine page into a background tab (Comet-style).
       onTabOpen: (url, label) => {
         console.log(`  (search mirrored into a background tab: ${label})`)

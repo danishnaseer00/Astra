@@ -204,6 +204,7 @@ async function submitAsk() {
     domains: domainsEl.value.split(',').map((s) => s.trim()).filter(Boolean),
     maxMs: Number(maxMsEl.value) || 600000,
     carry: $('#carry').checked,
+    memory: $('#memory').checked,
   })
   if (res && !res.ok) {
     appendLog(`ERROR: ${res.error}`)
