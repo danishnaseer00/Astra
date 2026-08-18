@@ -10,6 +10,11 @@ export interface ToolCallWire {
   id: string
   type: 'function'
   function: { name: string; arguments: string }
+  // Gemini 3 (Google's OpenAI-compat endpoint) attaches an opaque reasoning
+  // signature here. It MUST be echoed back verbatim when the assistant's tool
+  // calls are replayed next turn, or the API rejects the request (400). Only
+  // sent by Google; OpenAI/OpenRouter never include it.
+  extra_content?: { google?: { thought_signature?: string } }
 }
 
 export interface ToolSchema {
@@ -19,7 +24,7 @@ export interface ToolSchema {
 
 export interface ChatWithToolsResult {
   content: string
-  toolCalls: { id: string; name: string; args: Record<string, unknown> }[]
+  toolCalls: { id: string; name: string; args: Record<string, unknown>; extra_content?: ToolCallWire['extra_content'] }[]
 }
 
 // Plain chat round (no tools) — used by the phase-2/3 lesson CLIs.
@@ -39,7 +44,10 @@ console.log(`[llm:boot] base=${BASE} model=${MODEL} key=${KEY.startsWith('sk') |
 // limit — most 429s (and their 10-30s sleeps) never happen; (2) retry with
 // backoff when the gateway still pushes back or drops the connection.
 let lastCallAt = 0
-const MIN_GAP_MS = 2200
+// One call per step, actions between calls — but retry bursts must never trip
+// the provider's per-minute cap. Gemini free tier allows 15 RPM; 4s spacing
+// keeps even a retry storm under it.
+const MIN_GAP_MS = 4000
 
 interface ChatCompletion {
   choices?: {
@@ -118,7 +126,7 @@ export async function chatWithTools(messages: ChatMessage[], tools: ToolSchema[]
     } catch {
       // malformed arguments: pass through, the executor will report the failure
     }
-    return { id: tc.id, name: tc.function.name, args }
+    return { id: tc.id, name: tc.function.name, args, extra_content: tc.extra_content }
   })
   return { content: msg?.content ?? '', toolCalls }
 }

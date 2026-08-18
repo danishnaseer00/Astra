@@ -448,6 +448,8 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     }
 
     // The assistant's turn is part of history — including its tool calls.
+    // Gemini 3 requires the thought_signature echoed back verbatim on replay
+    // (400 otherwise); harmless for providers that never send it.
     push({
       role: 'assistant',
       content: decision.content || null,
@@ -455,6 +457,7 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
         id: tc.id,
         type: 'function' as const,
         function: { name: tc.name, arguments: JSON.stringify(tc.args) },
+        ...(tc.extra_content ? { extra_content: tc.extra_content } : {}),
       })),
     })
 
