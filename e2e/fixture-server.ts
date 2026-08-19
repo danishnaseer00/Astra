@@ -1,6 +1,3 @@
-// e2e/fixture-server.ts — a tiny 0-dep HTTP server that serves fixture pages
-// from an in-memory registry. The harness mutates the registry between runs so
-// every run sees fresh ground truth. No caching, localhost only.
 import { createServer, type Server } from 'node:http'
 
 export interface FixtureServer {

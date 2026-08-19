@@ -1,8 +1,3 @@
-// e2e/harness.ts — the generality battery: run the REAL agent loop (runAgent,
-// deny-all policy, no approvals, no canned goals) against RANDOMIZED fixture
-// sites. Ground truth changes every run, so a correct answer can only come
-// from actually reading and acting on the live DOM — not from memory,
-// pattern-matching, or the goal text. npm run e2e
 import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -62,8 +57,6 @@ async function runCase(
   results.push({ name, steps: run.steps, tokens: run.totalTokens, gated: run.gated, denied: run.denied, ok: v.ok, detail: v.detail })
 }
 
-// --- battery -----------------------------------------------------------------
-
 const { proc, port } = await launchChrome({})
 const s1 = await startFixtureServer()
 const s2 = await startFixtureServer()
@@ -71,7 +64,7 @@ try {
   await waitForPort(port)
   const cdp = await CDP.connect(port)
 
-  // T1: price extraction from a table, fresh random price every run.
+  // T1: price extraction
   {
     const t = randomCatalog('HoverCam X200')
     s1.set('/catalog', catalogPage(t.products))
@@ -82,7 +75,7 @@ try {
     }))
   }
 
-  // T2: multi-page navigation (index → category → product), random price+stock.
+  // T2: multi-page navigation 
   {
     const t = randomShop('Flux Router 9000')
     s1.set('/shop', shopIndexPage(t.index))
@@ -95,10 +88,7 @@ try {
     }))
   }
 
-  // T3: agent-level form wizardry — the order ID and total are generated
-  // server-side at submit time, so they are unguessable before the form is
-  // filled and submitted. The form page and its confirm endpoint share one
-  // server (relative form action).
+  // T3: agent-level form wizardry 
   {
     const { createServer } = await import('node:http')
     const live = createServer((req, res) => {
@@ -123,17 +113,13 @@ try {
     const livePort = (live.address() as { port: number }).port
     const goal = `Fill the order form at http://127.0.0.1:${livePort}/store/entry with name "Grace Hopper", email "grace@hopper.dev", birth date "1906-12-09", country "United Kingdom", then click Continue and report the order ID and total shown on the confirmation page.`
     await runCase('T3 form wizardry (unguessable order ID)', cdp, goal, (r) => ({
-      // The ORD-xxxxx ID is generated server-side only at submit time, so its
-      // presence proves the form was genuinely filled and submitted.
+
       ok: /ORD-[A-Z0-9]{5}/.test(r.answer) && /\$\d+\.\d{2}/.test(r.answer),
       detail: r.answer.slice(0, 160),
     }))
     live.close()
   }
 
-  // T5: the anti-parrot test — the SAME goal string as T1, but with fresh
-  // random ground truth and persistent memory enabled. Correct answers differ
-  // every run; echoing the previous run's answer fails.
   {
     const mk = () => randomCatalog('HoverCam X200')
     let prev = mk()
@@ -181,7 +167,7 @@ try {
   s2.close()
 }
 
-// --- summary -----------------------------------------------------------------
+ // summary
 console.log(`\n${'='.repeat(78)}\nSUMMARY — generality battery (${results.length} runs, all under deny-all)\n`)
 console.log('case'.padEnd(42) + 'steps'.padStart(6) + 'tokens'.padStart(9) + 'verdict'.padStart(9))
 for (const r of results) {

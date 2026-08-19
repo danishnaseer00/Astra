@@ -1,10 +1,3 @@
-// e2e/fixtures.ts — randomized fixture pages for the generality harness.
-// Every run, the harness regenerates the ground truth (prices, stock, order
-// IDs) and the pages are re-rendered from it: if the agent ever answered from
-// memory or pattern-matching instead of the live DOM, the assertions fail.
-// Labels/paths are deliberately gate-neutral (no pay/login/send/delete
-// keywords) so the harness can run the whole battery under denyAll.
-
 export interface CatalogProduct {
   name: string
   price: number
@@ -57,10 +50,6 @@ export function shopProductPage(p: ShopProduct): string {
 <p class="note">The exact price of ${p.name} is ${$(p.price)}.</p></body></html>`
 }
 
-// The order form submits with a plain GET to /store/entry/confirm (native form
-// behavior — the agent clicks "Continue" and the browser navigates with the
-// field values). The order ID and total are generated SERVER-side at submit
-// time, so the agent cannot read or guess them before filling the form.
 export function orderFormPage(): string {
   return `<!doctype html><html><head><meta charset="utf-8"><title>Nova Mart — place an order</title></head>
 <body><h1>Order entry</h1>
