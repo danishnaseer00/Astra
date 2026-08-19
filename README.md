@@ -10,6 +10,7 @@
 [![Dependencies](https://img.shields.io/badge/runtime%20dependencies-0-00C853?style=flat-square)](package.json)
 [![Tests](https://img.shields.io/badge/e2e%20battery-13%2F13-4CAF50?style=flat-square)](e2e/harness.ts)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+[![YOLO](https://img.shields.io/badge/Merging-YOLO-critical?style=flat-square)](https://github.com/)
 
 </div>
 
