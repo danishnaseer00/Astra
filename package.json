@@ -1,5 +1,5 @@
 {
-  "name": "agentic-browser",
+  "name": "astra",
   "private": true,
   "type": "module",
   "main": "dist/shell-main.cjs",

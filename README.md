@@ -1,6 +1,6 @@
 <div align="center">
 
-# Agentic Browser
+# Astra
 
 **An autonomous browser agent on the raw Chrome DevTools Protocol — zero runtime dependencies.**
 
@@ -17,7 +17,7 @@
 
 ## Overview
 
-Agentic Browser is an LLM-driven agent that operates a **real Chromium** end-to-end. It hand-writes the
+Astra is an LLM-driven agent that operates a **real Chromium** end-to-end. It hand-writes the
 Chrome DevTools Protocol client (WebSocket transport, JSON-RPC, input pipeline) instead of wrapping
 Puppeteer or Playwright — the entire runtime is built on Node.js built-ins.
 
