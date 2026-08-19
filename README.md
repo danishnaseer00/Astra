@@ -10,7 +10,6 @@
 [![Dependencies](https://img.shields.io/badge/runtime%20dependencies-0-00C853?style=flat-square)](package.json)
 [![Tests](https://img.shields.io/badge/e2e%20battery-13%2F13-4CAF50?style=flat-square)](e2e/harness.ts)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
-[![YOLO](https://img.shields.io/badge/Merging-YOLO-critical?style=flat-square)](https://github.com/)
 
 </div>
 
@@ -89,9 +88,9 @@ npm run shell
 
 | Variable      | Default                            | Purpose                          |
 | ------------- | ---------------------------------- | -------------------------------- |
-| `LLM_BASE_URL`| `https://api.llm7.io/v1`           | OpenAI-compatible endpoint       |
+| `LLM_BASE_URL`| `https://generativelanguage.googleapis.com/v1beta/openai` | OpenAI-compatible endpoint |
 | `LLM_API_KEY` | `unused`                           | API key                          |
-| `LLM_MODEL`   | `DeepSeek-V4-Flash-0731`           | Model id                         |
+| `LLM_MODEL`   | `gemini-3.5-flash-lite`            | Model id                         |
 | `CHROME_PATH` | Windows Chrome install path        | Browser binary for the CLI agent |
 
 ## Safety Model
