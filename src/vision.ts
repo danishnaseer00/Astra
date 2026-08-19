@@ -1,15 +1,3 @@
-// vision.ts — Phase 7: visual grounding.
-// The DOM snapshot sees structure; the screenshot sees pixels. These two
-// functions close the loop: describePage tells the model what the page LOOKS
-// like (canvas, images, layout, bot walls), and solveChallenge reads a
-// Turnstile/reCAPTCHA-style puzzle out of its iframe and clicks the answers.
-//
-// Captcha mechanics: the puzzle lives in a cross-origin iframe — JS can't
-// read it, but the compositor renders it. A clipped screenshot of the iframe
-// rect IS the puzzle; trusted input events at computed coordinates land
-// inside the widget. The vision model returns click targets in a 0-1000
-// scale, which we map onto the real rect — the model never sees pixel sizes.
-
 import type { CDP } from './browser.ts'
 import { sleep } from './browser.ts'
 import { describeImage } from './llm.ts'
@@ -27,8 +15,6 @@ export async function describePage(cdp: CDP, prompt = DESCRIBE_PROMPT): Promise<
   return out.trim().slice(0, 1200)
 }
 
-// One puzzle attempt: screenshot the iframe, ask for click targets, click.
-// Returns true when a round of clicks actually happened (caller re-checks).
 async function clickPuzzleRound(cdp: CDP, rect: { x: number; y: number; width: number; height: number }): Promise<boolean> {
   const png = await cdp.screenshotBase64(rect)
   const reply = await describeImage(
@@ -78,10 +64,6 @@ export interface ChallengeSolveResult {
   rounds: number
 }
 
-// Solve a visible challenge widget: up to `maxRounds` puzzle attempts, each
-// verified against a fresh screenshot. A challenge is "gone" when the solver
-// reports no more puzzle, or when the iframe no longer matches the challenge
-// signature (the caller re-detects and calls again if it persists).
 export async function solveChallenge(cdp: CDP, rect: ChallengeRect, maxRounds = 3): Promise<ChallengeSolveResult> {
   for (let round = 1; round <= maxRounds; round++) {
     console.log(`  [vision] challenge round ${round}/${maxRounds}`)

@@ -1,20 +1,9 @@
-// safety.ts — Phase 4: the rails from lesson 6 §5.
-// 1) Action gating: a blocklist (pay/login/send/delete) pauses the loop with a
-//    deterministic summary computed by CODE from the live DOM — never by the LLM.
-// 3) Domain scoping: each task declares its domains; navigate outside is a gate.
-// 4) Time budget is enforced by the loop; this file owns the verdict + policy.
-// 5) Audit log: every action, verdict, and reason, as JSONL on disk.
-
 import { mkdirSync, appendFileSync, readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import type { CDP } from './browser.ts'
 import { scrubPii } from './perceive.ts'
 
-// --- Rail 1: the blocklist ---------------------------------------------------
-// Words that make an action sensitive. A URL, element text, or input type
-// matching ANY rule trips the gate. Deny-by-default bias: a false positive
-// costs one step; a false negative costs real money or data.
 const BLOCKLIST: { label: string; re: RegExp }[] = [
   { label: 'pay', re: /pay|payment|checkout|purchase|buy-?now|\border\b|billing|\bcart\b/ },
   { label: 'login', re: /log-?in|sign-?in|signup|register|auth|password|credential/ },
@@ -22,9 +11,6 @@ const BLOCKLIST: { label: string; re: RegExp }[] = [
   { label: 'delete', re: /\bdelete\b|\bremove\b|destroy|deactivate|close\s*account/ },
 ]
 
-// The send rail is ACTION-only: navigating to a form page (httpbin's demo
-// lives at /forms/post) or typing into a comment field transmits nothing —
-// only the click that submits is gated. Destinations keep the rest.
 const DESTINATION_RAILS = BLOCKLIST.filter(({ label }) => label !== 'send')
 const TYPE_RAILS = BLOCKLIST.filter(({ label }) => label !== 'send')
 
@@ -35,11 +21,6 @@ function matchesBlocklist(text: string, rails: typeof BLOCKLIST): string[] {
   return [...new Set(hits)]
 }
 
-// One sanitizer for URL handling: the gate and the executor must judge the
-// same URL, or the model could smuggle junk past one of them.
-// Only trailing whitespace is always junk; a trailing ")" is stripped ONLY
-// when the URL has no matching "(" (models wrap URLs in prose parens, but
-// ")" is legal inside real URLs — Wikipedia titles, disambiguation pages).
 export const cleanUrl = (u: string): string => {
   const t = u.trim()
   const opens = (t.match(/\(/g) ?? []).length
@@ -47,21 +28,17 @@ export const cleanUrl = (u: string): string => {
   return closes > opens ? t.replace(/[)\s]+$/, '') : t
 }
 
-// --- Rail 3: domain scoping ---------------------------------------------------
 export function inScope(url: string, allowed: string[]): boolean {
   if (allowed.length === 0) return true
   let host: string
   try {
     host = new URL(url).hostname
   } catch {
-    return false // unparseable URL is out of scope
+    return false 
   }
   return allowed.some((d) => host === d || host.endsWith('.' + d))
 }
 
-// Rail 2 (scheme): only http(s) destinations are ever acceptable. The gate
-// must refuse file:/data:/javascript: etc. BEFORE the executor sees them —
-// the model should never be able to read local files or run script URLs.
 const WEB_SCHEME = /^https?:\/\//i
 
 export function isWebUrl(url: string): boolean {
@@ -76,10 +53,6 @@ const urlDomain = (url: string): string | undefined => {
   }
 }
 
-// Decode a search-engine redirect URL back to the real destination. The gate
-// and the executor must judge the SAME target, or the model could smuggle an
-// out-of-scope site through a redirect link (clicking a Bing/DDG result goes
-// through a /url?u=... or /l/?uddg=... hop that lands anywhere).
 export function decodeRedirect(href: string): string {
   try {
     const u = new URL(href)
@@ -102,7 +75,7 @@ export function decodeRedirect(href: string): string {
   return href
 }
 
-// --- The gate ----------------------------------------------------------------
+
 
 export interface GateVerdict {
   allowed: boolean
@@ -120,17 +93,12 @@ export interface SensitiveAction {
   domain?: string
 }
 
-// Decides ONE gated action. Called only when a rail matched.
 export interface Policy {
   decide(a: SensitiveAction): boolean | Promise<boolean>
 }
 
-// The CLI's safe default: sensitive actions are refused, period.
 export const denyAll: Policy = { decide: () => false }
-// For controlled demos and tests — never for real use.
 export const allowAll: Policy = { decide: () => true }
-// The terminal's approval card (Phase 5 replaces this with an Electron card).
-// Bounded: silence = deny, so an unattended run can never approve itself.
 export function promptPolicy(opts: { timeoutMs?: number } = {}): Policy {
   return {
     decide: async (a) => {
@@ -145,20 +113,9 @@ export function promptPolicy(opts: { timeoutMs?: number } = {}): Policy {
   }
 }
 
-// The page-changing tools. SINGLE source of truth: the agent loop uses it to
-// refuse batched mutating calls, and the gate gates exactly these. Keep the
-// tool list in one place so a new tool can't be forgotten in one of the two
-// copies (a real past bug: search navigates, but wasn't gated).
-// Phase 7 additions: tab tools change which page is active (snapshot stale →
-// mutating), and the form wizardry tools change the page.
 export const MUTATING = new Set(['navigate', 'click', 'type', 'open_tab', 'switch_tab', 'close_tab', 'select_option', 'upload_file'])
-// open_tab carries a destination URL like navigate; upload_file transmits a
-// local file to a site. Everything else on the element rails.
 const GATEABLE = new Set(['navigate', 'click', 'type', 'open_tab', 'upload_file', 'select_option'])
 
-// Inspect the target element for click/type gates — code reads the DOM, the
-// LLM never writes the summary. Deny on uncertainty: if the page won't tell
-// us what the element is, we refuse to touch it.
 async function inspectElement(cdp: CDP, selector: string): Promise<{ summary: string; text: string; href: string; isPassword: boolean } | null> {
   const info = (await cdp.evaluate(
     `(() => {
@@ -181,7 +138,6 @@ async function inspectElement(cdp: CDP, selector: string): Promise<{ summary: st
   return { ...info, summary: `<${kind}>${label}${where}` }
 }
 
-// Judge one tool call against every rail. Not gated → { allowed: true, gated: false }.
 export async function gate(
   cdp: CDP,
   tool: string,
@@ -198,7 +154,7 @@ export async function gate(
   if (tool === 'navigate' || tool === 'open_tab') {
     const url = cleanUrl(String(args.url ?? ''))
     domain = urlDomain(url)
-    // Rail 2: refuse non-web schemes outright — deny on uncertainty.
+
     if (!isWebUrl(url)) {
       why = ['non-web scheme']
       summary = `${tool === 'open_tab' ? 'Open tab' : 'Navigate to'} ${url}\nDENIED: only http(s) destinations are allowed`
@@ -210,9 +166,6 @@ export async function gate(
       summary = `${tool === 'open_tab' ? 'Open tab' : 'Navigate to'} ${url}`
     }
   } else if (tool === 'upload_file') {
-    // Attaching a local file to a page transmits data to the site — always a
-    // gate, regardless of the element's text. Summary names the file, never
-    // its contents.
     const sel = `[data-agent-i="${String(args.index)}"]`
     const el = await inspectElement(cdp, sel)
     if (!el) {
@@ -231,11 +184,6 @@ export async function gate(
     summary = el.summary
     why = matchesBlocklist(`${el.text} ${el.href} ${el.isPassword ? 'password' : ''}`, tool === 'type' ? TYPE_RAILS : BLOCKLIST)
     if (tool === 'type' && el.isPassword) why = why.length ? [...why, 'login'] : ['login']
-    // The click target's REAL destination (past any engine redirect) must
-    // respect the same rails as navigate — otherwise scope can be bypassed
-    // by clicking a search result that hops to an off-scope site. Only real
-    // links carry a destination; buttons/inputs have an empty href and are
-    // judged by their text/type above.
     if (el.href) {
       const dest = decodeRedirect(el.href)
       if (!isWebUrl(dest)) {
@@ -253,9 +201,6 @@ export async function gate(
   return { allowed, gated: true, summary, reason: `matched: ${why.join(', ')}`, why }
 }
 
-// --- Rail 5: the audit log -----------------------------------------------------
-// JSONL on disk: every action, verdict, and reason. Typed text is redacted —
-// the audit stores what was touched, never what was typed.
 
 export interface AuditEntry {
   ts: string
@@ -272,8 +217,6 @@ export function sanitizeArgs(args: Record<string, unknown>): Record<string, unkn
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(args)) {
     if (k === 'text') out[k] = '[redacted]'
-    // upload_file carries a local path — the audit keeps the file NAME only,
-    // never the path (a path can leak the username or machine layout).
     else if (k === 'file' && typeof v === 'object' && v !== null) {
       const path = String((v as { path?: string }).path ?? '')
       out[k] = { name: path.split(/[\\/]/).pop() || '?' }

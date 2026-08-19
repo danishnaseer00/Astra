@@ -1,7 +1,3 @@
-// perceive.ts — Phase 2: turn the page into what the agent sees.
-// Builds an indexed snapshot of interactive elements and scrubs PII
-// BEFORE anything leaves the machine toward the LLM (lesson 3).
-
 import type { CDP } from './browser.ts'
 
 export interface SnapshotElement {
@@ -10,8 +6,6 @@ export interface SnapshotElement {
   type: string
   text: string
   href: string
-  // Form wizardry: the field's name attribute and multi-select flag — a form
-  // field is identified by its name/label, not just its position.
   name: string
   multiple: boolean
 }
@@ -21,15 +15,9 @@ export interface Snapshot {
   title: string
   elements: SnapshotElement[]
   render: string
-  // Bounding box of the Turnstile/captcha iframe, if one is visible.
-  // Cross-origin frames are unreadable from the main frame, but TRUSTED INPUT
-  // EVENTS at these coordinates land inside the widget — the checkbox tick
-  // clicks the center, and the vision solver clips this rect to read puzzles.
   challengeRect: { x: number; y: number; width: number; height: number } | null
 }
 
-// Sensitive data must never reach the model: replace, don't strip.
-// Order matters: card numbers are pure digits, so scrub them first.
 const CARD_RE = /\b(?:\d[ -]?){13,19}\b/g
 const PHONE_RE = /\+?\b\d[\d\s().-]{7,}\d\b/g
 const EMAIL_RE = /\b[\w.+-]+@[\w-]+\.[\w.]+\b/g
@@ -41,7 +29,6 @@ export function scrubPii(text: string): string {
     .replace(EMAIL_RE, '[EMAIL]')
 }
 
-// Walk the page and index what an agent could interact with.
 export async function buildSnapshot(cdp: CDP): Promise<Snapshot> {
   const raw = (await cdp.evaluate(
     `(() => {
@@ -95,19 +82,12 @@ export async function buildSnapshot(cdp: CDP): Promise<Snapshot> {
   )) as { url: string; title: string; bodyText: string; challengeRect: { x: number; y: number; width: number; height: number } | null; elements: SnapshotElement[] }
 
   const elements = raw.elements.map((el) => ({ ...el, text: scrubPii(el.text), href: scrubPii(el.href) }))
-  // URL and title can carry PII (emails, tokens, query strings) — scrub them
-  // before the render ever reaches the model.
   const url = scrubPii(raw.url)
   const title = scrubPii(raw.title)
   const challenge = detectChallenge(title, scrubPii(raw.bodyText))
   const warning = challenge
     ? '\n⚠ CHALLENGE PAGE (bot check in an iframe — the agent will try to tick the checkbox; if the challenge persists, do NOT waste more steps. Use the search tool or navigate to another source.)\n'
     : ''
-  // A page with almost no interactive elements is usually a JS app that never
-  // hydrated for us or a bot wall — NOT an empty page to keep retrying.
-  // The nav-chrome threshold alone is useless on real sites (a pricing page
-  // has dozens of nav links), so also treat a page whose readable text is
-  // tiny as blind: real content is at least a paragraph of prose.
   const contentless = raw.bodyText.trim().length < 120
   const blind = (elements.length < 5 || contentless) && !challenge
     ? '\n⚠ This page exposes almost no content (JS-rendered shell or bot protection). Do NOT keep navigating to it. Use the search tool or answer from facts already gathered.\n'
@@ -115,19 +95,13 @@ export async function buildSnapshot(cdp: CDP): Promise<Snapshot> {
   return { ...raw, url, title, elements, render: renderSnapshot(url, title, elements) + warning + blind }
 }
 
-// Cloudflare/Turnstile-style "are you a human" challenges run inside a
-// cross-origin iframe — the DOM snapshot cannot see into it, but a TRUSTED
-// INPUT EVENT at the iframe's coordinates ticks the checkbox regardless of
-// origin. The agent auto-clicks it (bounded), then routes around if needed.
+
 const CHALLENGE_RE = /verify you are human|are you a human|turnstile|cf-chl|checking your browser|security check/i
 
 export function detectChallenge(title: string, text: string): boolean {
   return CHALLENGE_RE.test(`${title} ${text}`)
 }
 
-// The exact text the LLM reads — indexed so the agent can point at things.
-// Lossy by design (lesson 3): the model sees a capped number of elements
-// (buildSnapshot already slices to 120, so no second cap is needed here).
 export function renderSnapshot(url: string, title: string, elements: SnapshotElement[]): string {
   const lines = elements.map((el) => {
     const kind = el.type ? `${el.tag}[${el.type}]` : el.tag

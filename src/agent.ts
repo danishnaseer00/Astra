@@ -11,8 +11,6 @@ import { FactsStore, extractDomains } from './memory.ts'
 
 const BUDGET = 24
 
-// The tool vocabulary from lesson 5, grown through the phases: six core
-// tools, search (6), then vision + tabs + form wizardry (7). Few and stable.
 const TOOLS: ToolSchema[] = [
   {
     type: 'function',
@@ -149,7 +147,6 @@ const TOOLS: ToolSchema[] = [
   },
 ]
 
-// The agent's constitution (lesson 5 §3).
 const SYSTEM =
   'You are a web agent. The user gives you a goal; the live page is your only source of truth. ' +
   'Each element in a snapshot has an index — refer to elements by index only, never invent selectors. ' +
@@ -262,8 +259,6 @@ async function execute(tab: { cdp: CDP }, name: string, args: Record<string, unk
       return ok ? `Uploaded "${name}" (${data.length} bytes).` : 'FAILED: index is not a file input'
     }
     case 'observe': {
-      // Vision grounding: the DOM snapshot is blind to pixels. One screenshot,
-      // one description — cheap enough to use when the DOM lies or hides.
       return 'VISUAL DESCRIPTION:\n' + (await describePage(cdp))
     }
     case 'scroll': {
@@ -273,9 +268,6 @@ async function execute(tab: { cdp: CDP }, name: string, args: Record<string, unk
     case 'extract': {
       await sleep(600)
 
-      // Benchmark data lives in tables (arXiv papers, HF model cards), which
-      // sit mid-page — beyond both the head slice and the tail slice. Pull
-      // table contents out directly so they always reach the model.
       const tables = (await cdp.evaluate(
         `(() => {
           const out = []
@@ -362,7 +354,7 @@ async function execute(tab: { cdp: CDP }, name: string, args: Record<string, unk
       let engineUrl = ''
       let results = await tryEngine(`https://www.bing.com/search?q=${encodeURIComponent(q)}`)
       if (results.length > 0) engineUrl = `https://www.bing.com/search?q=${encodeURIComponent(q)}`
-      // Thin or empty results are usually a layout quirk — merge in DDG's.
+    
       if (results.length < 3) {
         const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`
         const ddg = await tryEngine(ddgUrl)
@@ -374,8 +366,7 @@ async function execute(tab: { cdp: CDP }, name: string, args: Record<string, unk
         }
       }
       if (results.length === 0) return 'FAILED: search engines returned no results — try a different query'
-      // The shell mirrors the engine page into a background tab (Comet-style),
-      // so the user can watch the search that produced these results.
+ 
       try {
         opts?.onTabOpen?.(engineUrl, `search: ${q.slice(0, 22)}`)
       } catch { /* the shell must never break a search */ }
@@ -401,45 +392,29 @@ export interface AgentRun {
   denied: number
 }
 
-// Phase 4 options: the safety rails are pluggable so the CLI, tests, and the
-// Phase 5 shell each bring their own policy surface.
 export interface AgentOptions {
   policy?: Policy
   allowedDomains?: string[]
   audit?: AuditLog
   timeBudgetMs?: number
-  // Phase 5: the shell's Stop button. Checked between steps — an in-flight
-  // action completes, the next step aborts.
   isCancelled?: () => boolean
-  // Phase 6: session memory — context from previous turns (the shell's
-  // "carry previous turn" continuation).
   context?: string
-  // Phase 7: the shell mirrors search engine pages into background tabs so the
-  // user can watch where the agent is looking (Comet-style tab-per-search).
   onTabOpen?: (url: string, label?: string) => void
-  // Phase 7: tab tools — the host that creates/switches/closes tabs. Absent
-  // (shell single-view) → tab tools report FAILED.
   tabs?: TabHost
-  // Phase 7: persistent memory — facts survive runs via the domain-keyed store.
   memory?: FactsStore
 }
 
-// The whole agent: perceive → decide → execute, with a hard step budget.
-// Lossy by design: only the CURRENT snapshot is sent (it's a moment old — the
-// rest is stale), tool results are truncated, and history is capped. The model
-// gets exactly what it needs to act now, not an accumulating transcript.
 const TOOL_RESULT_CAP = 2000
 const HISTORY_CAP = 20
 const estimateTokens = (s: string) => Math.round(s.length / 4)
 
 export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}): Promise<AgentRun> {
-  // Safety defaults: deny by default, no scope limit, no audit, 5-minute cap.
+  
   const { policy = denyAll, allowedDomains = [], audit, timeBudgetMs = 5 * 60_000, isCancelled, context, tabs, memory } = opts
   const startedAt = Date.now()
-  // Tab tools re-point this holder at other pages; everything else reads
-  // `tab.cdp`, so switching tabs mid-run just works.
+
   const tab: { cdp: CDP } = { cdp }
-  // History holds assistant turns, tool results, nudges — NOT snapshots.
+
   const history: ChatMessage[] = []
   let totalTokens = 0
   let gated = 0
@@ -450,22 +425,12 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
   const push = (msg: ChatMessage) => {
     history.push(msg)
     if (history.length > HISTORY_CAP) {
-      // Trimming runs on EVERY push — mid-batch, an assistant's tool results
-      // are still being appended. Never split a tool_calls message from its
-      // results, and never leave a tool message at the head: Mistral rejects a
-      // 'tool' message that follows 'user' (400 invalid_request_message_order).
       let drop = history.length - HISTORY_CAP
       while (drop < history.length && history[drop].role === 'tool') drop++
       history.splice(0, drop)
     }
   }
 
-  // Loop detection: repeated identical actions burn steps and budget — the
-  // same navigation, the same search query, or extract on the same page.
-  // Count each action; once one hits 3+, nudge the model ONCE to stop and use
-  // what it has. The nudge rides inside the snapshot system message — a user
-  // message would sit directly after a tool result, which Mistral's API
-  // rejects (400).
   const actionCounts = new Map<string, number>()
   const actionNudged = new Set<string>()
   let pendingNudge = ''
@@ -482,8 +447,6 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     }
   }
 
-  // Facts gathered during the run survive the budget: if the loop ends
-  // exhausted, the answer still reports what was learned.
   const gathered: string[] = []
   const remember = (block: string): void => {
     const slim = block.replace(/\s+/g, ' ').trim().slice(0, 300)
@@ -493,8 +456,6 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
   const gatheredTail = (): string =>
     gathered.length ? '\n\nFACTS GATHERED SO FAR:\n- ' + gathered.join('\n- ') : ''
 
-  // Persistent memory: every exit path goes through finish() so the run's
-  // residue (goal, facts, answer) is stored per-domain before returning.
   const memoryDomains = new Set<string>()
   for (const d of allowedDomains) memoryDomains.add(d)
   for (const d of extractDomains(goal + (context ?? ''))) memoryDomains.add(d)
@@ -510,11 +471,7 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     if (Date.now() - startedAt > timeBudgetMs) {
       return finish('[time budget exhausted] task incomplete' + gatheredTail(), step)
     }
-    // Budget-pressure nudge: exploration tasks (T6, T14) used to burn all 24
-    // steps wandering or re-scanning, then exhaust without an answer. Once the
-    // budget is low, push the model EVERY step to synthesize and call done —
-    // unless a loop nudge is already queued (it is equally urgent). One-shot
-    // didn't work (T12): the model ignored a single hint and kept paginating.
+
     if (BUDGET - step <= 6 && !pendingNudge) {
       if (!budgetNudged) {
         budgetNudged = true
@@ -529,10 +486,7 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
       const why = err instanceof Error ? err.message : String(err)
       return finish(`[agent stuck: could not perceive the page — ${why}]` + gatheredTail(), step)
     }
-    // Challenge handling, Phase 7: one checkbox tick (cheap, clears most
-    // Turnstile walls), then the VISION solver (reads the puzzle out of a
-    // clipped screenshot and clicks the answers). If both fail, the snapshot
-    // warning tells the model to route around — never burn the budget.
+
     if (snapshot.challengeRect && challengeClicks < 1) {
       challengeClicks++
       const { x, y } = snapshot.challengeRect
@@ -552,12 +506,8 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
         continue // fresh snapshot next step — the model sees a normal page
       }
       console.log(`  !! challenge not cleared (${result.rounds} rounds) — model will route around`)
-      // fall through: the snapshot's ⚠ warning tells the model to move on
+      
     }
-    // The snapshot system message carries any pending loop nudge. buildContext
-    // is PURE (takes the nudge as an argument) because it is called for token
-    // estimation AND for the real model call — a side effect here would let
-    // the estimate consume the nudge and the model would never see it.
     const buildContext = (nudge: string): ChatMessage[] => [
       { role: 'system', content: SYSTEM },
       {
@@ -572,25 +522,17 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     totalTokens += stepTokens
     console.log(`\n--- step ${step} (${snapshot.elements.length} elements, ~${stepTokens.toLocaleString()} tokens) ---`)
 
-    // The nudge is captured and cleared exactly once, on the FIRST real model
-    // call of the step — later retries in this step see no nudge.
     const decide = async () => {
       const nudge = pendingNudge
       pendingNudge = ''
       return chatWithTools(buildContext(nudge), TOOLS)
     }
-    // The free-tier gateway can fail mid-run (429 concurrency, timeouts). The
-    // loop must degrade to a truthful failure message, never crash.
+
     let decision: ChatWithToolsResult
     try {
       decision = await decide()
 
-      // Failure mode: models sometimes reply with plain text (or schema-echo junk)
-      // instead of a tool call. Lesson 5's contract: only done(answer) ends a task.
-      // Reject non-tool replies with a nudge, bounded, then stop gracefully.
-      const notAToolReply = (s: string) => !s.trim() || s.includes('</') // empty, or schema-echo junk
-      // Escalating nudges: free-tier gateways intermittently drop into a DSML
-      // schema-echo loop where only a concrete example breaks them out.
+      const notAToolReply = (s: string) => !s.trim() || s.includes('</') 
       const NUDGES = [
         'Your last reply was not acceptable: it must be a tool call, or done(answer) with the final answer. Plain text is not accepted. Try again.',
         'Your last reply was still not acceptable. Emit exactly one tool call in the documented format — nothing else. If the goal is met, use done(answer) with the complete final answer.',
@@ -599,12 +541,10 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
       for (let retry = 0; retry < NUDGES.length && decision.toolCalls.length === 0 && notAToolReply(decision.content); retry++) {
         console.log(`  (non-tool reply: ${JSON.stringify(decision.content.slice(0, 60))} — nudging #${retry + 1})`)
         push({ role: 'system', content: NUDGES[retry] })
-        if (retry > 0) await sleep(800) // pace retries; gateways misbehave under back-to-back load
+        if (retry > 0) await sleep(800) 
         decision = await decide()
       }
-      // Glitch mode survives nudges because the poisoned history keeps steering
-      // it. Fresh start — no history, no nudges, explicit JSON example — is the
-      // strongest escape, so it runs for ANY non-tool reply, not just junk.
+
       if (decision.toolCalls.length === 0) {
         console.log('  (plain-text reply — retrying with minimal context)')
         const minimal = (showExample: boolean): ChatMessage[] => [
@@ -634,17 +574,13 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
     }
     if (decision.toolCalls.length === 0) {
       const raw = decision.content.trim()
-      // Real answers are short. Empty, markup, a page dump, or a bare tool-call
-      // echo = glitch, not an answer.
+
       const junk = !raw || raw.includes('</') || raw.includes('```') || /^\s*\{?\s*"name"\s*:\s*"/.test(raw) || raw.length > 500
       const answer = junk ? '[agent stuck: the model stopped replying with tool calls]' + gatheredTail() : raw
       console.log('  (stopping on plain-text reply)')
       return finish(answer, step)
     }
 
-    // The assistant's turn is part of history — including its tool calls.
-    // Gemini 3 requires the thought_signature echoed back verbatim on replay
-    // (400 otherwise); harmless for providers that never send it.
     push({
       role: 'assistant',
       content: decision.content || null,
@@ -656,18 +592,13 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
       })),
     })
 
-    // Phase 6 batching: read-only tools may share a step, but mutating tools
-    // change the page — the snapshot contract (latest snapshot is truth) means
-    // at most ONE of them per decision. Later ones fail loudly, in-band.
-    // Scroll does not mutate the DOM but moves it: indexes captured before a
-    // scroll are stale, so click/type after scroll are rejected the same way.
     let mutated = false
     let scrolled = false
     for (const tc of decision.toolCalls) {
       if (tc.name === 'done') {
         const answer = String(tc.args.answer ?? '').trim()
         if (!answer) {
-          // done without an answer is a tool failure, not an exit
+        
           console.log(`  -> done(${JSON.stringify(tc.args)}) — FAILED: empty answer, task continues`)
           push({ role: 'tool', tool_call_id: tc.id, content: 'FAILED: done requires a non-empty answer. Call done again with the full answer, or call another tool to gather facts.' })
           continue
@@ -676,15 +607,14 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
         return finish(answer, step)
       }
 
-      // Batched mutating calls after the first one operate on a stale page.
+  
       if (MUTATING.has(tc.name) && mutated) {
         const stale = 'FAILED: the page changed earlier in this step, so this index/URL is stale. The latest snapshot is truth — act on it in the NEXT step, one change per step.'
         console.log(`  -> ${tc.name}(${JSON.stringify(tc.args).slice(0, 120)}) — FAILED (stale: page already changed this step)`)
         push({ role: 'tool', tool_call_id: tc.id, content: stale })
         continue
       }
-      // A scroll shifts every element; indexes from the pre-scroll snapshot
-      // no longer point where the model thinks they do.
+
       if ((tc.name === 'click' || tc.name === 'type') && scrolled) {
         const stale = 'FAILED: the page scrolled earlier in this step, so this index is stale. The latest snapshot is truth — wait for the NEXT step to act on a fresh snapshot.'
         console.log(`  -> ${tc.name}(${JSON.stringify(tc.args).slice(0, 120)}) — FAILED (stale: scrolled this step)`)
@@ -693,8 +623,7 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
       }
       if (MUTATING.has(tc.name)) mutated = true
 
-      // Phase 4: every action crosses the gate first. A denied action goes
-      // back to the model as a refusal — never executed, never retried.
+
       console.log(`[agent:gate] ${tc.name}(${JSON.stringify(tc.args).slice(0, 80)})`)
       const verdict = await gate(tab.cdp, tc.name, tc.args, allowedDomains, policy)
       const atUrl = audit ? ((await tab.cdp.evaluate('location.href').catch(() => '')) as string) : ''
@@ -728,17 +657,13 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
       if (tc.name === 'navigate') bumpAction('nav', cleanUrl(String(tc.args.url ?? '')))
       if (tc.name === 'search') bumpAction('search', String(tc.args.query ?? '').trim().toLowerCase())
       if (tc.name === 'scroll') scrolled = true
-      // Keep the facts the model earned: search hits and priced extracts are
-      // remembered in compact form, so a budget-exhausted run still reports
-      // what it learned instead of a bare failure line.
+
       if (tc.name === 'search') {
-        // The first result lines are the actionable ones (title — URL).
+  
         const hits = result.split('\n').filter((l) => l.includes(' — ')).slice(0, 5).join('\n')
         if (hits) remember(hits)
       }
       if (tc.name === 'extract') {
-        // Loop-keyed by page, not question: re-extracting the SAME page is the
-        // waste pattern (a page that yields nothing, extracted over and over).
         const at = ((await cdp.evaluate('location.href').catch(() => '')) as string) || '(no page)'
         bumpAction('extract', cleanUrl(at))
         const priced = result.match(/PRICES ON THIS PAGE:\n([\s\S]*?)(?=\nPAGE TEXT:)/)?.[1]
@@ -753,9 +678,7 @@ export async function runAgent(cdp: CDP, goal: string, opts: AgentOptions = {}):
         verdict: 'executed',
       })
       console.log(`  -> ${tc.name}(${JSON.stringify(tc.args).slice(0, 120)})\n     ${result.slice(0, 200)}`)
-      // Lossy: old page dumps get truncated before they enter history. Keep
-      // the END of a dump too — head-only truncation hid mid-page benchmark
-      // tables: arXiv/HF pages lead with boilerplate, tables sit below it.
+
       const cap = TOOL_RESULT_CAP
       const slim =
         result.length > cap

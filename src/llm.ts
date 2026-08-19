@@ -14,10 +14,6 @@ export interface ToolCallWire {
   id: string
   type: 'function'
   function: { name: string; arguments: string }
-  // Gemini 3 (Google's OpenAI-compat endpoint) attaches an opaque reasoning
-  // signature here. It MUST be echoed back verbatim when the assistant's tool
-  // calls are replayed next turn, or the API rejects the request (400). Only
-  // sent by Google; OpenAI/OpenRouter never include it.
   extra_content?: { google?: { thought_signature?: string } }
 }
 
@@ -31,7 +27,6 @@ export interface ChatWithToolsResult {
   toolCalls: { id: string; name: string; args: Record<string, unknown>; extra_content?: ToolCallWire['extra_content'] }[]
 }
 
-// Plain chat round (no tools) — used by the phase-2/3 lesson CLIs.
 export async function chat(messages: ChatMessage[], temperature = 0.4): Promise<string> {
   const json = await callOpenAI({ model: MODEL, messages, temperature })
   return json.choices?.[0]?.message?.content ?? ''
@@ -43,14 +38,7 @@ const MODEL = process.env.LLM_MODEL ?? 'DeepSeek-V4-Flash-0731'
 
 console.log(`[llm:boot] base=${BASE} model=${MODEL} key=${KEY.startsWith('sk') || KEY.length > 12 ? 'set' : 'MISSING/INVALID'}`)
 
-// Free-tier gateways rate-limit hard (30 RPM) and stall connections under
-// load. Two defenses: (1) a client-side throttle so we never burst past the
-// limit — most 429s (and their 10-30s sleeps) never happen; (2) retry with
-// backoff when the gateway still pushes back or drops the connection.
 let lastCallAt = 0
-// One call per step, actions between calls — but retry bursts must never trip
-// the provider's per-minute cap. Gemini free tier allows 15 RPM; 4s spacing
-// keeps even a retry storm under it.
 const MIN_GAP_MS = 4000
 
 interface ChatCompletion {
@@ -63,7 +51,6 @@ interface ChatCompletion {
 async function callOpenAI(body: Record<string, unknown>): Promise<ChatCompletion> {
   const RETRIES = 8
   for (let attempt = 0; attempt <= RETRIES; attempt++) {
-    // Throttle: space requests out so bursts don't trip the per-minute cap.
     const wait = lastCallAt + MIN_GAP_MS - Date.now()
     if (wait > 0) await new Promise((r) => setTimeout(r, wait))
     console.log(`[llm:call] attempt=${attempt} t=${new Date().toISOString().slice(11, 19)}`)
@@ -75,9 +62,7 @@ async function callOpenAI(body: Record<string, unknown>): Promise<ChatCompletion
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${KEY}`,
-          // No keep-alive: undici can deadlock on a stale pooled socket (the
-          // gateway's edge silently kills idle connections — headers arrive,
-          // then the body stalls forever and even the abort never fires).
+  
           Connection: 'close',
         },
         body: JSON.stringify(body),
@@ -101,8 +86,7 @@ async function callOpenAI(body: Record<string, unknown>): Promise<ChatCompletion
       return j
     }
     if (res.status === 429 && attempt < RETRIES) {
-      // The gateway reports the wait inside error.retry_after — honor it,
-      // but never sleep longer than 20s on a single retry.
+
       const body = (await res.json().catch(() => ({}))) as { error?: { retry_after?: number }; retry_after?: number }
       const retryAfter = Math.min(20, Number(body.error?.retry_after ?? body.retry_after ?? 2))
       console.log(`  (rate limited — retrying in ${retryAfter}s)`)
@@ -128,21 +112,20 @@ export async function chatWithTools(messages: ChatMessage[], tools: ToolSchema[]
     try {
       args = JSON.parse(tc.function.arguments)
     } catch {
-      // malformed arguments: pass through, the executor will report the failure
+    
     }
     return { id: tc.id, name: tc.function.name, args, extra_content: tc.extra_content }
   })
   return { content: msg?.content ?? '', toolCalls }
 }
 
-// Vision round (no tools): ask the model about a screenshot. The OpenAI-compat
-// endpoints (including Gemini's) accept images as data-URL parts.
+
 export async function chatVision(messages: { role: 'user' | 'system'; content: ContentPart[] }[]): Promise<string> {
   const json = await callOpenAI({ model: MODEL, messages, temperature: 0.2 })
   return json.choices?.[0]?.message?.content ?? ''
 }
 
-// One-shot image question — the vision tools' workhorse.
+
 export async function describeImage(base64Png: string, prompt: string): Promise<string> {
   return chatVision([
     {

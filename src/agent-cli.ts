@@ -1,12 +1,3 @@
-// agent-cli.ts — run a task: npm run agent -- "your goal here"
-// Phase 4 safety flags:
-//   --ask                 prompt for approval on gated actions (default: deny)
-//   --allow               approve every gated action (controlled demos only)
-//   --domains a.com,b.com scope navigation to these domains
-//   --max-ms N            time budget in milliseconds (default 5 min)
-// Phase 7 flags:
-//   --memory              persist learned facts across runs (memory/facts.json)
-//   --no-tabs             disable tab tools (they are on by default)
 import { parseArgs } from 'node:util'
 import { join } from 'node:path'
 import { launchChrome, waitForPort, CDP, killChrome, CliTabHost } from './browser.ts'
