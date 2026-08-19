@@ -1,5 +1,3 @@
-// Build the Electron shell: bundle main + preload with esbuild (electron is
-// external — it's the runtime), copy the panel UI. No runtime deps in dist.
 import { build } from 'esbuild'
 import { cpSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'

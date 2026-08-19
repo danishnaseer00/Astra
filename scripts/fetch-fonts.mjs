@@ -10,7 +10,6 @@ const blocks = css.split('@font-face').slice(1)
 const out = []
 let n = 0
 for (const b of blocks) {
-  // Latin only: unicode-range lists U+0000-00FF first for the latin subset.
   if (!/U\+0000-00FF/.test(b)) continue
   const family = (b.match(/font-family:\s*'([^']+)'/) ?? [])[1]
   const weight = (b.match(/font-weight:\s*(\d+)/) ?? [])[1]
